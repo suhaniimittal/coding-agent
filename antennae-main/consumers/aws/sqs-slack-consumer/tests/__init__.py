@@ -1,1 +1,0 @@
-# Slack consumer tests
