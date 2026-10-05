@@ -1,0 +1,24 @@
+{
+    "name": "coding-agent",
+    "version": "1.0.0",
+    "description": "Takes a Technical Design Document (PDF) and raises Pull Requests implementing it — one PR per affected service, never auto-merged.",
+    "config": {
+        "triggers": [
+            {
+              "name": "uploaded_files",
+              "type": "file",
+              "required": true,
+              "accepts": ".pdf",
+              "description": "The Technical Design Document to implement, as a PDF.",
+              "friendly_name": "TDD (PDF)"
+            },
+            {
+              "name": "base_branch_by_service",
+              "type": "text",
+              "required": false,
+              "description": "Optional JSON object mapping service name to the PR's base branch, e.g. {\"orders\": \"develop\"}. Omit to use each service's manifest branch or repo default.",
+              "friendly_name": "Base branch overrides"
+            }
+        ]
+    }
+}

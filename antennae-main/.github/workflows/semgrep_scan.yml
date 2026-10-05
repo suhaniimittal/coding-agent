@@ -1,0 +1,397 @@
+name: "Semgrep - Security Scanning"
+
+on:
+  pull_request:
+    branches:
+      - main
+
+permissions:
+  contents: read
+  security-events: write
+  actions: read
+  id-token: write
+  pull-requests: write
+  issues: write
+
+env:
+  SERVICE_NAME: antennae
+  OUTPUT_FILE: semgrep-results-antennae
+  PYTHON_VERSION: 3.12
+
+jobs:
+  semgrep:
+    name: Semgrep Scan
+    runs-on: self-hosted
+    timeout-minutes: 120
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@1af3b93b6815bc44a9784bd300feb67ff0d1eeb3
+        with:
+          fetch-depth: 0
+
+      - name: Set up Python
+        uses: actions/setup-python@83679a892e2d95755f2dac6acb0bfd1e9ac5d548
+        with:
+          python-version: ${{ env.PYTHON_VERSION }}
+
+      - name: Install Python & Semgrep
+        run: |
+          python3 -m pip install --upgrade pip
+          pip3 install semgrep
+
+      - name: Run Semgrep CLI
+        id: semgrep_run
+        run: |
+          semgrep scan \
+          --config auto \
+          --config "p/python" \
+          --config "p/kubernetes" \
+          --config "p/cwe-top-25" \
+          --config "p/comment" \
+          --config "p/r2c-security-audit" \
+          --config "p/owasp-top-ten" \
+          --config "p/secure-defaults" \
+          --config "p/dockerfile" \
+          --json --json-output=${{ env.OUTPUT_FILE }}.json
+
+      - name: Locate & cat any JSON files
+        if: always()
+        run: |
+          OUTFILE="${{ env.OUTPUT_FILE }}.json"
+          echo "Looking for: $OUTFILE"
+          if [ -f "$OUTFILE" ]; then
+            echo "---- $OUTFILE ----"
+            sed -n '1,200p' "$OUTFILE" || cat "$OUTFILE"
+            echo "---- end $OUTFILE ----"
+          else
+            echo "File not found: $OUTFILE"
+          fi
+
+      - name: Render Semgrep results to Markdown file (with shortlink)
+        run: |
+          set -euo pipefail
+          SRC="${{ env.OUTPUT_FILE }}.json"
+          OUT="${{ env.OUTPUT_FILE }}.md"
+
+          echo "Generating $OUT from $SRC"
+
+          # Header
+          cat > "$OUT" <<'MD'
+
+          | CWE | OWASP| Path | Lines | Severity | Message |
+          |------|-------:|:--------:|-----|:-----:|:--------|
+          MD
+
+          if ! jq -e '.results and (.results|length > 0)' "$SRC" > /dev/null 2>&1; then
+            echo "" >> "$OUT"
+            echo "_No Semgrep findings._" >> "$OUT"
+            echo "Wrote $OUT (no results)."
+            exit 0
+          fi
+
+
+          cat > /tmp/semgrep_to_md.jq <<'JQ'
+          .results[]
+          | {
+              path: (.path // ""),
+              # build a safe "start - end" string only if numbers present
+              lines: (if (.start.line? and .end.line?) then "\(.start.line) - \(.end.line)" else "" end),
+              severity: (.extra.severity // ""),
+              cwe: ((.extra.metadata.cwe // null) | if . == null then "" elif type == "string" then . elif type == "array" then join(", ") else "" end),
+              owasp: ((.extra.metadata.owasp // null) | if . == null then "" elif type == "string" then . elif type == "array" then join(", ") else "" end),
+              message: (.extra.message // ""),
+              check_id: (.check_id // ""),
+              shortlink: (.extra.metadata.shortlink // "")
+            }
+          | (
+              [
+                (
+                  .cwe
+                  | gsub("\\|"; "\\\\|")
+                ),
+                (
+                  .owasp
+                  | gsub("\\|"; "\\\\|")
+                ),
+                (
+                  .path
+                  | gsub("\\|"; "\\\\|")
+                  | gsub("\r?\n"; " ")
+                  | gsub("[[:space:]]+"; " ")
+                ),
+                (
+                  .lines
+                  | gsub("\\|"; "\\\\|")
+                ),
+                (
+                  .severity
+                  | gsub("\\|"; "\\\\|")
+                ),
+                (
+                  .message
+                  | gsub("\\|"; "\\\\|")
+                  | gsub("\r?\n"; " ")
+                  | gsub("[[:space:]]+"; " ")
+                )
+                +
+                (
+                  if (.shortlink | length) > 0 then
+                    " ([Resource Link](" + .shortlink + "))"
+                  else
+                    ""
+                  end
+                )
+              ]
+            )
+          | @tsv
+          JQ
+
+          # Run jq and convert TSV into Markdown table rows
+          jq -r -f /tmp/semgrep_to_md.jq "$SRC" \
+            | awk -F'\t' '{
+                printf("| %s | %s | %s | %s | %s | %s | %s |\n", $1,$2,$3,$4,$5,$6,$7)
+              }' >> "$OUT"
+
+          echo "Wrote $OUT with $(jq '.results|length' "$SRC") rows."
+
+      - name: Append Semgrep results to GitHub summary
+        run: |
+          echo "## Semgrep Findings" >> "$GITHUB_STEP_SUMMARY"
+          cat ${{ env.OUTPUT_FILE }}.md >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Prepare Semgrep summary
+        id: summary
+        if: ${{ github.event_name == 'pull_request' }}
+        run: |
+          set -euo pipefail
+          SRC="${{ env.OUTPUT_FILE }}.json"
+          MD="${{ env.OUTPUT_FILE }}.md"
+          OUT="summary.txt"
+
+          # safe defaults
+          CRITICAL_COUNT=0
+          HIGH_COUNT=0
+          WARNING_COUNT=0
+          INFO_COUNT=0
+          TOTAL=0
+
+          if [ -f "$SRC" ]; then
+            # Count severities: treat "ERROR" & "CRITICAL" as critical
+            # Count Severities: "HIGH" as high.
+            # Count Severities: "WARNING" as warning.
+            # Count Severities: "INFO" as info.
+            CRITICAL_COUNT=$(jq '[.results[] | select((.extra.severity // "") == "ERROR") or ((.extra.severity // "") == "CRITICAL")] | length' "$SRC" 2>/dev/null || echo 0)
+            HIGH_COUNT=$(jq '[.results[] | select((.extra.severity // "") == "HIGH")] | length' "$SRC" 2>/dev/null || echo 0)
+            WARNING_COUNT=$(jq '[.results[] | select((.extra.severity // "") == "WARNING")] | length' "$SRC" 2>/dev/null || echo 0)
+            INFO_COUNT=$(jq '[.results[] | select((.extra.severity // "") == "INFO")] | length' "$SRC" 2>/dev/null || echo 0)
+            TOTAL=$(jq '[.results[]] | length' "$SRC" 2>/dev/null || echo 0)
+          fi
+
+          # Create a compact summary text from the rendered markdown (fall back to JSON if md not present)
+          if [ -f "$MD" ]; then
+            # keep the header + first 200 lines (adjust as needed)
+            {
+              echo "Semgrep quick summary"
+              echo "====================="
+              echo ""
+              echo "Service: ${{ env.SERVICE_NAME }}"
+              echo ""
+              echo "Totals: $TOTAL results — $CRITICAL_COUNT ERROR, $HIGH_COUNT HIGH, $WARNING_COUNT WARNING, $INFO_COUNT INFO"
+              echo ""
+              echo "Top findings (truncated):"
+              echo ""
+              head -n 200 "$MD" || cat "$MD"
+            } > "$OUT"
+          else
+            {
+              echo "Semgrep quick summary"
+              echo "====================="
+              echo ""
+              echo "Service: ${{ env.SERVICE_NAME }}"
+              echo ""
+              echo "Totals: $TOTAL results — $CRITICAL_COUNT ERROR, $HIGH_COUNT HIGH, $WARNING_COUNT WARNING, $INFO_COUNT INFO"
+              echo ""
+              echo "Rendered markdown not available; showing raw JSON excerpt:"
+              jq '.results[0:20]' "$SRC" 2>/dev/null || echo "(no JSON available)"
+            } > "$OUT"
+          fi
+
+          HAS_ISSUES_ERRORS="false"
+          if [ "$TOTAL" -gt 0 ]; then
+            HAS_ISSUES_ERRORS="true"
+          fi
+
+          # export outputs for later steps
+          echo "critical_count=$CRITICAL_COUNT" >> "$GITHUB_OUTPUT"
+          echo "high_count=$HIGH_COUNT" >> "$GITHUB_OUTPUT"
+          echo "warning_count=$WARNING_COUNT" >> "$GITHUB_OUTPUT"
+          echo "info_count=$INFO_COUNT" >> "$GITHUB_OUTPUT"
+          echo "has_alerts_issues=$HAS_ISSUES_ERRORS" >> "$GITHUB_OUTPUT"
+
+      - name: Post or Update Semgrep summary as PR comment
+        if: ${{ github.event_name == 'pull_request' }}
+        uses: actions/github-script@ed597411d8f924073f98dfc5c65a23a2325f34cd
+        with:
+          script: |
+            const fs = require('fs');
+
+            const service = '${{ env.SERVICE_NAME }}';
+            const marker = `<!-- semgrep-results:${service} -->`;
+            const hasVulns = '${{ steps.summary.outputs.has_alerts_issues }}' === 'true';
+            const criticalCount = parseInt('${{ steps.summary.outputs.critical_count }}') || 0;
+            const highCount = parseInt('${{ steps.summary.outputs.high_count }}') || 0;
+            const warningCount = parseInt('${{ steps.summary.outputs.warning_count }}') || 0;
+            const infoCount = parseInt('${{ steps.summary.outputs.info_count }}') || 0;
+
+            // Read the summary text (created above)
+            let summary = '';
+            try {
+              summary = fs.readFileSync('${{ env.OUTPUT_FILE }}.md', 'utf8');
+            } catch (error) {
+              summary = 'Unable to read semgrep summary. Please check the workflow logs.';
+            }
+
+            // Get IST time
+            const now = new Date();
+            const options = { timeZone: 'Asia/Kolkata', hour12: false, year: 'numeric', month: '2-digit', day: '2-digit', hour: '2-digit', minute: '2-digit', second: '2-digit' };
+            const istString = now.toLocaleString('en-IN', options);
+            const runTime = `${istString} IST`;
+
+            // Build Security tab link for this PR (helpful)
+            const owner = context.repo.owner;
+            const repo = context.repo.repo;
+            const prNumber = context.issue.number;
+            const securityLink = `https://github.com/${owner}/${repo}/security/code-scanning?query=is%3Aopen+pr%3A${prNumber}`;
+            const workflowRunLink = `${context.serverUrl}/${owner}/${repo}/actions/runs/${context.runId}`;
+
+            // Get all comments on the PR
+            const { data: comments } = await github.rest.issues.listComments({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              issue_number: context.issue.number,
+            });
+
+            // Find an existing bot comment with our marker
+            const botComment = comments.find(comment =>
+              comment.user && comment.user.login === 'github-actions[bot]' && comment.body && comment.body.includes(marker)
+            );
+
+            // Determine if passed or failed based on blocking criteria (CRITICAL or HIGH)
+            const isBlocking = (criticalCount > 0 || highCount > 0);
+
+            // Status badge / prefix
+            // We use hasVulns for "Issues Detected", but blocking status for "FAILED/PASSED" prefix maybe? 
+            // Or just stick to "Issues Detected". 
+            // Let's make it clear: 
+            let statusBadge = '**NO ISSUES**';
+            if (hasVulns) {
+                statusBadge = '**ISSUES DETECTED**';
+            }
+
+            const statusPrefix = isBlocking ? '[FAILED]' : (hasVulns ? '[WARNING]' : '[PASSED]');
+
+            // Compose header + body
+            const header = `${marker}
+
+            ## ${statusPrefix} Semgrep Security Scan Results
+
+            **Status:** ${statusBadge}
+
+            **Scan Time:** ${runTime}  
+            **Service:** \`${service}\`  
+            **Workflow Run:** [View Details](${workflowRunLink})
+
+            ---
+
+            ${summary}
+            `;
+
+            let footer = '';
+            if (isBlocking) {
+                 footer = `
+            ---
+
+            > **Critical/High Issues found. Please fix them before merging.**
+
+            **Summary:** ${criticalCount} CRITICAL, ${highCount} HIGH, ${warningCount} WARNING, ${infoCount} INFO.
+
+            Full scan reports are available in the [workflow artifacts](${workflowRunLink}).`;
+            } else if (hasVulns) {
+                footer = `
+            ---
+
+            **Warnings found, but no blocking issues.**
+
+            **Summary:** ${criticalCount} CRITICAL, ${highCount} HIGH, ${warningCount} WARNING, ${infoCount} INFO.
+
+            Full scan reports are available in the [workflow artifacts](${workflowRunLink}).`;
+            } else {
+                 footer = `
+
+            ---
+
+            **All security checks passed!** This PR is safe to merge.
+
+            Full scan reports are available in the [workflow artifacts](${workflowRunLink}).`;
+            }
+
+            const newBody = header + footer;
+
+            if (botComment) {
+              // Update the existing comment
+              await github.rest.issues.updateComment({
+                owner: context.repo.owner,
+                repo: context.repo.repo,
+                comment_id: botComment.id,
+                body: newBody,
+              });
+            } else {
+              // Create a new comment for this service
+              await github.rest.issues.createComment({
+                owner: context.repo.owner,
+                repo: context.repo.repo,
+                issue_number: context.issue.number,
+                body: newBody,
+              });
+            }
+
+      - name: Block PR on CRITICAL and HIGH findings
+        if: ${{ github.event_name == 'pull_request' }}
+        run: |
+          set -euo pipefail
+
+          CRITICAL_COUNT=${{ steps.summary.outputs.critical_count }}
+          HIGH_COUNT=${{ steps.summary.outputs.high_count }}
+          WARNING_COUNT=${{ steps.summary.outputs.warning_count }}
+          INFO_COUNT=${{ steps.summary.outputs.info_count }}
+
+          echo "================================================"
+          echo "Security Check: Blocking PR on CRITICAL/HIGH"
+          echo "================================================"
+          echo "Total: $CRITICAL_COUNT CRITICAL, $HIGH_COUNT HIGH"
+          echo "Ignored: $WARNING_COUNT WARNING, $INFO_COUNT INFO"
+          echo "================================================"
+          echo ""
+
+          if [ "$CRITICAL_COUNT" -gt 0 ] || [ "$HIGH_COUNT" -gt 0 ]; then
+            echo "BLOCKING: CRITICAL or HIGH findings detected!"
+            echo ""
+            echo "Issues/Alert found for this PR. Please fix them before merging."
+            echo ""
+            exit 1
+          elif [ "$WARNING_COUNT" -gt 0 ]; then
+            echo "WARNING: WARNING findings detected!"
+            echo ""
+            echo "Issues/Alert found for this PR. Please fix them if possible."
+            echo ""
+            exit 0
+          elif [ "$INFO_COUNT" -gt 0 ]; then
+            echo "INFO: INFO findings detected!"
+            echo ""
+            echo "Issues/Alert found for this PR. Please fix them if possible."
+            echo ""
+            exit 0
+          else
+            echo "No CRITICAL, HIGH, WARNING or INFO findings. PR is safe to merge."
+          fi

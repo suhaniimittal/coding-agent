@@ -1,0 +1,607 @@
+# Single-job unit tests: all webhooks + consumers on one runner, JUnit under reports/.
+# No artifacts. Consumers use CodeArtifact (ursa) after AWS OIDC.
+name: Unit Tests
+
+on:
+  pull_request:
+    branches:
+      - main
+
+permissions:
+  id-token: write
+  contents: read
+  checks: write
+  pull-requests: write
+
+concurrency:
+  group: antennae-unit-test-${{ github.workflow }}-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: true
+
+env:
+  PYTHON_VERSION: "3.12"
+  REPORTS_DIR: reports
+  # Match nebula unit_test_template: branch coverage gate (prioritize branch-rate in Cobertura)
+  REQUIRED_BRANCH_COVERAGE_PERCENT: "80"
+
+jobs:
+  unit-tests:
+    runs-on: self-hosted
+    steps:
+      - name: Checkout
+        uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683
+
+      - name: Set up Python
+        uses: actions/setup-python@83679a892e2d95755f2dac6acb0bfd1e9ac5d548
+        with:
+          python-version: ${{ env.PYTHON_VERSION }}
+
+      - name: Install uv
+        uses: astral-sh/setup-uv@803947b9bd8e9f986429fa0c5a41c367cd732b41
+
+      - name: Prepare reports directory
+        run: mkdir -p "${{ env.REPORTS_DIR }}"
+
+      # Scan webhooks/aws/* and consumers/aws/* (pyproject.toml + tests/)
+      - name: Discover webhooks and consumers
+        env:
+          SCRIPT: |
+            import json
+            import os
+            import tomllib
+            from pathlib import Path
+
+            def _pytest_cov_from_pyproject(pkg_dir):
+                pp = pkg_dir / "pyproject.toml"
+                if not pp.is_file():
+                    return None
+                try:
+                    cfg = tomllib.loads(pp.read_text(encoding="utf-8"))
+                    t = cfg.get("tool", {}).get("antennae", {}).get("unit-test", {})
+                    c = t.get("pytest_cov")
+                    if c:
+                        return c if str(c).startswith("--cov") else f"--cov={c}"
+                except Exception:
+                    pass
+                return None
+
+            def webhook_cov_arg(pkg_dir):
+                o = _pytest_cov_from_pyproject(pkg_dir)
+                if o:
+                    return o
+                if pkg_dir.name == "generic-webhook":
+                    return "--cov=webhook_handler"
+                return "--cov=."
+
+            def consumer_cov_arg(pkg_dir):
+                return _pytest_cov_from_pyproject(pkg_dir) or "--cov=src"
+
+            root = Path(os.environ.get("GITHUB_WORKSPACE", ".")).resolve()
+            webhooks = []
+            wh_base = root / "webhooks" / "aws"
+            if wh_base.is_dir():
+                for d in sorted(wh_base.iterdir(), key=lambda p: p.name):
+                    if not d.is_dir():
+                        continue
+                    if not (d / "pyproject.toml").is_file() or not (d / "tests").is_dir():
+                        continue
+                    webhooks.append(
+                        {
+                            "name": d.name,
+                            "dir": str(d.resolve().relative_to(root.resolve()).as_posix()),
+                            "cov": webhook_cov_arg(d),
+                        }
+                    )
+            consumers = []
+            co_base = root / "consumers" / "aws"
+            if co_base.is_dir():
+                for d in sorted(co_base.iterdir(), key=lambda p: p.name):
+                    if not d.is_dir():
+                        continue
+                    if not (d / "pyproject.toml").is_file() or not (d / "tests").is_dir():
+                        continue
+                    consumers.append(
+                        {
+                            "name": d.name,
+                            "dir": str(d.resolve().relative_to(root.resolve()).as_posix()),
+                            "cov": consumer_cov_arg(d),
+                        }
+                    )
+            if not webhooks:
+                raise SystemExit(
+                    "No webhook packages under webhooks/aws/*/ (need pyproject.toml + tests/)"
+                )
+            if not consumers:
+                raise SystemExit(
+                    "No consumer packages under consumers/aws/*/ (need pyproject.toml + tests/)"
+                )
+            data = {"webhooks": webhooks, "consumers": consumers}
+            out = root / "reports" / "unit-test-manifest.json"
+            out.parent.mkdir(parents=True, exist_ok=True)
+            out.write_text(json.dumps(data, indent=2), encoding="utf-8")
+            print("Webhooks (%d):" % len(webhooks), ", ".join(w["name"] for w in webhooks))
+            print("Consumers (%d):" % len(consumers), ", ".join(c["name"] for c in consumers))
+        run: python3 -c "import os; exec(os.environ['SCRIPT'])"
+
+      - name: Webhook unit tests
+        id: webhook_tests
+        continue-on-error: true
+        env:
+          R: ${{ github.workspace }}/${{ env.REPORTS_DIR }}
+          SCRIPT: |
+            import json
+            import os
+            import subprocess
+            import sys
+            from pathlib import Path
+
+            root = Path(os.environ["GITHUB_WORKSPACE"]).resolve()
+            R = Path(os.environ["R"]).resolve()
+            data = json.loads(
+                (root / "reports" / "unit-test-manifest.json").read_text(encoding="utf-8")
+            )
+            failed = 0
+            for pkg in data["webhooks"]:
+                name, rel, cov = pkg["name"], pkg["dir"], pkg["cov"]
+                d = root / rel
+                print("::group::Webhook: %s" % name)
+                cmd = (
+                    "uv sync --no-install-project --group dev && "
+                    "uv run pytest tests/ "
+                    "--junitxml=%s/junit-%s.xml %s "
+                    "--cov-branch --cov-report=xml:%s/coverage-%s.xml -v"
+                    % (R, name, cov, R, name)
+                )
+                p = subprocess.run(cmd, shell=True, cwd=d)
+                print("::endgroup::")
+                if p.returncode != 0:
+                    failed = 1
+            sys.exit(failed)
+        run: python3 -c "import os; exec(os.environ['SCRIPT'])"
+
+      - name: Configure AWS credentials (CodeArtifact)
+        id: aws
+        continue-on-error: true
+        uses: aws-actions/configure-aws-credentials@61815dcd50bd041e203e49132bacad1fd04d2708
+        with:
+          aws-region: ${{ secrets.AWS_REGION }}
+          role-to-assume: arn:aws:iam::${{ secrets.AWS_ACCOUNT_ID }}:role/github-action-deploy-role
+
+      - name: Consumer unit tests
+        id: consumer_tests
+        continue-on-error: true
+        if: steps.aws.outcome == 'success'
+        env:
+          R: ${{ github.workspace }}/${{ env.REPORTS_DIR }}
+          UV_INDEX_CODEARTIFACT_USERNAME: aws
+          SCRIPT: |
+            import json
+            import os
+            import subprocess
+            import sys
+            from pathlib import Path
+
+            root = Path(os.environ["GITHUB_WORKSPACE"]).resolve()
+            R = Path(os.environ["R"]).resolve()
+            data = json.loads(
+                (root / "reports" / "unit-test-manifest.json").read_text(encoding="utf-8")
+            )
+            failed = 0
+            for pkg in data["consumers"]:
+                name, rel, cov = pkg["name"], pkg["dir"], pkg["cov"]
+                d = root / rel
+                print("::group::Consumer: %s" % name)
+                cmd = (
+                    "uv sync --no-install-project --group dev && "
+                    "uv run pytest tests/ "
+                    "--junitxml=%s/junit-%s.xml %s "
+                    "--cov-branch --cov-report=xml:%s/coverage-%s.xml -v"
+                    % (R, name, cov, R, name)
+                )
+                p = subprocess.run(cmd, shell=True, cwd=d)
+                print("::endgroup::")
+                if p.returncode != 0:
+                    failed = 1
+            sys.exit(failed)
+        run: |
+          set -euo pipefail
+          TOKEN=$(aws codeartifact get-authorization-token \
+            --domain ${{ secrets.CODEARTIFACT_DOMAIN }} \
+            --domain-owner ${{ secrets.AWS_ACCOUNT_ID }} \
+            --region ${{ secrets.AWS_REGION }} \
+            --query authorizationToken --output text)
+          if [ -z "$TOKEN" ]; then
+            echo "::error::CodeArtifact token empty."
+            exit 1
+          fi
+          export UV_INDEX_CODEARTIFACT_PASSWORD="$TOKEN"
+          python3 -c "import os; exec(os.environ['SCRIPT'])"
+
+      - name: Build PR comment
+        if: always() && !cancelled() && github.event_name == 'pull_request'
+        env:
+          AWS_OK: ${{ steps.aws.outcome == 'success' && '1' || '0' }}
+          REPORTS_DIR: ${{ env.REPORTS_DIR }}
+          REQUIRED_BRANCH_PCT: ${{ env.REQUIRED_BRANCH_COVERAGE_PERCENT }}
+        run: |
+          python3 <<'PY'
+          import json
+          import os
+          import xml.etree.ElementTree as ET
+          from pathlib import Path
+
+          root = Path(os.environ.get("REPORTS_DIR", "reports"))
+          aws_ok = os.environ.get("AWS_OK", "0") == "1"
+          required_branch = float(os.environ.get("REQUIRED_BRANCH_PCT", "80"))
+          marker = "<!-- antennae-unit-test-results-marker -->"
+
+          manifest_path = root / "unit-test-manifest.json"
+          if not manifest_path.exists():
+              raise SystemExit(f"Missing {manifest_path} (discover step must run first)")
+          manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+          webhooks = [w["name"] for w in manifest["webhooks"]]
+          consumers = [c["name"] for c in manifest["consumers"]]
+          COVERAGE_PACKAGES = [("Webhooks", n) for n in webhooks] + [("Consumers", n) for n in consumers]
+
+          def parse_junit(path: Path):
+              tests = failures = errors = skipped = 0
+              time_sec = 0.0
+              failed_cases = []
+              if not path.exists() or path.stat().st_size == 0:
+                  return None
+              try:
+                  tree = ET.parse(path)
+                  r = tree.getroot()
+              except ET.ParseError:
+                  return {
+                      "tests": 0,
+                      "failures": 1,
+                      "errors": 0,
+                      "skipped": 0,
+                      "time": 0.0,
+                      "failed_cases": [("junit", "parse error", "**Invalid JUnit XML**")],
+                  }
+              suites = [r] if r.tag == "testsuite" else list(r.findall(".//testsuite"))
+              for s in suites:
+                  tests += int(float(s.attrib.get("tests", "0")))
+                  failures += int(float(s.attrib.get("failures", "0")))
+                  errors += int(float(s.attrib.get("errors", "0")))
+                  skipped += int(float(s.attrib.get("skipped", "0")))
+                  time_sec += float(s.attrib.get("time", "0"))
+              for tc in r.findall(".//testcase"):
+                  name = tc.attrib.get("name", "unknown")
+                  file_attr = tc.attrib.get("file") or tc.attrib.get("classname", "")
+                  fn = tc.find("failure")
+                  en = tc.find("error")
+                  node = fn if fn is not None else en
+                  if node is not None:
+                      msg = node.attrib.get("message", "Error")
+                      detail = (node.text or "").strip().split("\n")[-1] if node.text else ""
+                      failed_cases.append((file_attr or name, name, f"**{msg}**: `{detail}`"))
+              return {
+                  "tests": tests,
+                  "failures": failures,
+                  "errors": errors,
+                  "skipped": skipped,
+                  "time": time_sec,
+                  "failed_cases": failed_cases,
+              }
+
+          consumer_results = {c: None for c in consumers}
+          webhook_results = {w: None for w in webhooks}
+
+          if root.exists():
+              for p in root.rglob("*.xml"):
+                  stem = p.stem
+                  if not stem.startswith("junit-"):
+                      continue
+                  pkg = stem[len("junit-") :]
+                  data = parse_junit(p)
+                  if pkg in consumer_results:
+                      consumer_results[pkg] = data
+                  elif pkg in webhook_results:
+                      webhook_results[pkg] = data
+
+          missing_report = {
+              "tests": 0,
+              "failures": 0,
+              "errors": 1,
+              "skipped": 0,
+              "time": 0.0,
+              "failed_cases": [
+                  ("", "report", "**No JUnit report** (run failed, skipped, or not written)")
+              ],
+          }
+
+          missing_aws = {
+              **missing_report,
+              "failed_cases": [
+                  ("", "report", "**Consumers not run** — AWS/CodeArtifact login failed")
+              ],
+          }
+
+          def fill_missing_consumer(d):
+              if d is not None:
+                  return d
+              return missing_aws if not aws_ok else missing_report
+
+          def fill_missing_webhook(d):
+              return d if d is not None else missing_report
+
+          def suite_ok_consumer(raw):
+              if not aws_ok:
+                  return False
+              d = fill_missing_consumer(raw)
+              fe = d["failures"] + d["errors"]
+              if fe > 0:
+                  return False
+              if d["tests"] == 0 and not d.get("failed_cases"):
+                  return False
+              return True
+
+          def suite_ok_webhook(raw):
+              d = fill_missing_webhook(raw)
+              fe = d["failures"] + d["errors"]
+              if fe > 0:
+                  return False
+              if d["tests"] == 0 and not (raw and raw.get("failed_cases")):
+                  return False
+              return True
+
+          all_ok = True
+          for d in webhook_results.values():
+              if not suite_ok_webhook(d):
+                  all_ok = False
+                  break
+          if all_ok:
+              for d in consumer_results.values():
+                  if not suite_ok_consumer(d):
+                      all_ok = False
+                      break
+          if not aws_ok:
+              all_ok = False
+
+          # --- Branch coverage (Cobertura), same priority as nebula unit_test_template ---
+          cov_rows = []
+          sum_bc = sum_bv = 0
+          rates_fallback = []
+          cov_missing = []
+
+          for area, pkg in COVERAGE_PACKAGES:
+              if area == "Consumers" and not aws_ok:
+                  cov_rows.append((area, pkg, None, "skipped"))
+                  cov_missing.append(pkg)
+                  continue
+              cp = root / f"coverage-{pkg}.xml"
+              if not cp.exists() or cp.stat().st_size == 0:
+                  cov_rows.append((area, pkg, None, "missing"))
+                  cov_missing.append(pkg)
+                  continue
+              try:
+                  el = ET.parse(cp).getroot()
+              except ET.ParseError:
+                  cov_rows.append((area, pkg, None, "bad XML"))
+                  cov_missing.append(pkg)
+                  continue
+              br = el.attrib.get("branch-rate")
+              bc_a, bv_a = el.attrib.get("branches-covered"), el.attrib.get("branches-valid")
+              pct_row = None
+              if bc_a is not None and bv_a is not None:
+                  ibc, ibv = int(float(bc_a)), int(float(bv_a))
+                  if ibv > 0:
+                      sum_bc += ibc
+                      sum_bv += ibv
+                      pct_row = 100.0 * ibc / ibv
+                  elif br is not None:
+                      pct_row = float(br) * 100.0
+              if pct_row is None and br is not None:
+                  pct_row = float(br) * 100.0
+              if pct_row is None:
+                  cov_missing.append(pkg)
+              else:
+                  rates_fallback.append(pct_row)
+              src = "branch-rate" if br is not None else "Σ branches"
+              cov_rows.append((area, pkg, pct_row, src))
+
+          if sum_bv > 0:
+              combined_branch_pct = 100.0 * sum_bc / sum_bv
+              combined_note = f"weighted **{sum_bc}** / **{sum_bv}** branches"
+          elif rates_fallback:
+              combined_branch_pct = sum(rates_fallback) / len(rates_fallback)
+              combined_note = "average of package rates (no branch counts on XML roots)"
+          else:
+              combined_branch_pct = None
+              combined_note = "n/a"
+
+          branch_gate_ok = (
+              aws_ok
+              and not cov_missing
+              and combined_branch_pct is not None
+              and combined_branch_pct >= required_branch
+          )
+
+          root.mkdir(parents=True, exist_ok=True)
+          (root / "coverage_gate_ok").write_text("1" if branch_gate_ok else "0", encoding="utf-8")
+          (root / "coverage_branch_combined.txt").write_text(
+              f"{combined_branch_pct if combined_branch_pct is not None else -1:.4f}", encoding="utf-8"
+          )
+
+          tests_ok = all_ok
+          full_ok = tests_ok and branch_gate_ok
+
+          md = [
+              "## Antennae unit tests",
+              "",
+              f"**Overall:** {'✅ PASS (tests + branch coverage)' if full_ok else '❌ FAIL'}",
+              f"**Tests:** {'✅' if tests_ok else '❌'} · **Branch coverage gate (≥{required_branch:.0f}%):** {'✅' if branch_gate_ok else '❌'}",
+              "",
+              "_Single job. Consumers use CodeArtifact (`ursa`). Branch gate matches nebula (branch-rate / branch counts in Cobertura)._",
+              "",
+              "### Consumers",
+              "",
+              "| Package | Passed | Failed | Errors | Skipped | Time (s) | Status |",
+              "|:--|--:|--:|--:|--:|--:|:--:|",
+          ]
+
+          for name in consumers:
+              raw = consumer_results[name]
+              d = fill_missing_consumer(raw)
+              fe = d["failures"] + d["errors"]
+              passed = max(0, d["tests"] - fe - d["skipped"])
+              ok = suite_ok_consumer(raw)
+              st = "✅" if ok else "❌"
+              if not aws_ok:
+                  lbl = "skipped (AWS/CodeArtifact)" if raw is None else (
+                      "pass" if ok else (f"{fe} failed/error" if fe else "no tests")
+                  )
+              else:
+                  lbl = "pass" if ok else (f"{fe} failed/error" if fe else "no tests / missing report")
+              md.append(
+                  f"| `{name}` | {passed} | {d['failures']} | {d['errors']} | {d['skipped']} | {d['time']:.2f} | {st} {lbl} |"
+              )
+
+          md.extend(
+              [
+                  "",
+                  "### Webhooks",
+                  "",
+                  "| Package | Passed | Failed | Errors | Skipped | Time (s) | Status |",
+                  "|:--|--:|--:|--:|--:|--:|:--:|",
+              ]
+          )
+
+          for name in webhooks:
+              raw = webhook_results[name]
+              d = fill_missing_webhook(raw)
+              fe = d["failures"] + d["errors"]
+              passed = max(0, d["tests"] - fe - d["skipped"])
+              ok = suite_ok_webhook(raw)
+              st = "✅" if ok else "❌"
+              lbl = "pass" if ok else (f"{fe} failed/error" if fe else "no tests / missing report")
+              md.append(
+                  f"| `{name}` | {passed} | {d['failures']} | {d['errors']} | {d['skipped']} | {d['time']:.2f} | {st} {lbl} |"
+              )
+
+          md.extend(
+              [
+                  "",
+                  f"### Branch coverage (required ≥ **{required_branch:.0f}%** combined)",
+                  "",
+                  "| Area | Package | Branch % |",
+                  "|:--|:--|--:|",
+              ]
+          )
+          for area, pkg, pct, _src in cov_rows:
+              if pct is None:
+                  why = "missing" if pkg in cov_missing else "n/a"
+                  md.append(f"| {area} | `{pkg}` | — ({why}) |")
+              else:
+                  md.append(f"| {area} | `{pkg}` | {pct:.2f}% |")
+          if combined_branch_pct is not None:
+              md.append(
+                  f"| **Combined** | all packages | **{combined_branch_pct:.2f}%** ({combined_note}) |"
+              )
+          else:
+              md.append("| **Combined** | — | *could not compute* |")
+          md.append("")
+          if not branch_gate_ok:
+              reasons_cov = []
+              if cov_missing:
+                  reasons_cov.append("Missing or incomplete Cobertura XML for: `" + "`, `".join(cov_missing) + "`")
+              if combined_branch_pct is not None and combined_branch_pct < required_branch:
+                  reasons_cov.append(
+                      f"Combined branch coverage **{combined_branch_pct:.2f}%** is below required **{required_branch:.0f}%**."
+                  )
+              elif combined_branch_pct is None and aws_ok:
+                  reasons_cov.append("Could not compute combined branch coverage.")
+              if not aws_ok:
+                  reasons_cov.append("Consumers not run — cannot evaluate full-repo branch gate.")
+              md.append("**Coverage gate:** ❌ " + " ".join(reasons_cov))
+          else:
+              md.append(
+                  f"**Coverage gate:** ✅ Combined branch **{combined_branch_pct:.2f}%** ≥ **{required_branch:.0f}%**"
+              )
+          md.append("")
+
+          failed_detail = []
+          for group, results, fill_fn in [
+              ("Consumers", consumer_results, fill_missing_consumer),
+              ("Webhooks", webhook_results, fill_missing_webhook),
+          ]:
+              for pkg, raw in results.items():
+                  d = fill_fn(raw)
+                  for _f, case_name, info in d.get("failed_cases", []):
+                      failed_detail.append((group, pkg, case_name, info))
+          md.append("")
+          md.append("<details>")
+          if failed_detail:
+              md.append(f"<summary>❌ Failed / skipped ({len(failed_detail)} row(s))</summary>")
+              md.append("")
+              md.append("| Area | Package | Test | Details |")
+              md.append("|:--|:--|:--|:--|")
+              for g, pkg, n, i in failed_detail:
+                  md.append(f"| {g} | `{pkg}` | `{n}` | {i} |")
+          else:
+              md.append("<summary>✅ No failing test cases</summary>")
+              md.append("")
+              md.append("All reported suites passed.")
+          md.append("</details>")
+          md.append("")
+          md.append(marker)
+
+          Path("test-results-comment.md").write_text("\n".join(md), encoding="utf-8")
+          PY
+
+      - name: Find existing comment
+        if: always() && !cancelled() && github.event_name == 'pull_request'
+        id: fc
+        uses: peter-evans/find-comment@b30e6a3c0ed37e7c023ccd3f1db5c6c0b0c23aad
+        with:
+          issue-number: ${{ github.event.pull_request.number }}
+          comment-author: "github-actions[bot]"
+          body-includes: "antennae-unit-test-results-marker"
+
+      - name: Post or update PR comment
+        if: always() && !cancelled() && github.event_name == 'pull_request'
+        uses: peter-evans/create-or-update-comment@e8674b075228eee787fea43ef493e45ece1004c9
+        with:
+          comment-id: ${{ steps.fc.outputs.comment-id }}
+          issue-number: ${{ github.event.pull_request.number }}
+          body-path: test-results-comment.md
+          edit-mode: replace
+
+      - name: Publish checks (JUnit)
+        if: always() && !cancelled()
+        continue-on-error: true
+        uses: EnricoMi/publish-unit-test-result-action@c950f6fb443cb5af20a377fd0dfaa78838901040
+        with:
+          files: reports/junit-*.xml
+          check_name: Antennae unit tests
+          comment_mode: off
+
+      - name: Quality gate
+        if: always() && !cancelled()
+        env:
+          REQ: ${{ env.REQUIRED_BRANCH_COVERAGE_PERCENT }}
+        run: |
+          echo "See PR comment for per-suite and branch coverage."
+          if [ "${{ steps.webhook_tests.outcome }}" != "success" ]; then
+            echo "::error::One or more webhook test suites failed."
+            exit 1
+          fi
+          if [ "${{ steps.aws.outcome }}" != "success" ]; then
+            echo "::error::AWS/CodeArtifact configuration failed; consumer tests were not run."
+            exit 1
+          fi
+          if [ "${{ steps.consumer_tests.outcome }}" != "success" ]; then
+            echo "::error::One or more consumer test suites failed."
+            exit 1
+          fi
+          if [ ! -f reports/coverage_gate_ok ]; then
+            echo "::error::Missing reports/coverage_gate_ok (PR comment step may have failed)."
+            exit 1
+          fi
+          if [ "$(cat reports/coverage_gate_ok)" != "1" ]; then
+            pct=$(cat reports/coverage_branch_combined.txt 2>/dev/null || echo "?")
+            echo "::error::Branch coverage gate failed — need combined branch ≥ ${REQ}% (got ${pct}). See PR comment."
+            exit 1
+          fi

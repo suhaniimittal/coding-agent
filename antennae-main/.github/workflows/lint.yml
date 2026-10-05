@@ -1,0 +1,389 @@
+# Lint pipeline: single-runner job (mirrors unit_test.yml). ruff runs on every file in every
+# package under consumers/aws/* and webhooks/aws/*, regardless of what the PR changed. One PR
+# comment per package: first 5 errors in a table, the rest behind a collapsible <details>,
+# capped and size-truncated so a comment is never rejected for exceeding GitHub's comment size
+# limit.
+name: Lint
+
+on:
+  pull_request:
+    branches:
+      - main
+
+permissions:
+  id-token: write
+  contents: read
+  pull-requests: write
+
+concurrency:
+  group: antennae-lint-${{ github.workflow }}-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: true
+
+env:
+  PYTHON_VERSION: "3.12"
+  REPORTS_DIR: reports
+  # GitHub's hard limit on an issue/PR comment body; we stay under this with margin.
+  GITHUB_COMMENT_MAX_CHARS: "65536"
+
+jobs:
+  lint:
+    runs-on: self-hosted
+    steps:
+      - name: Checkout
+        uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683
+
+      - name: Set up Python
+        uses: actions/setup-python@83679a892e2d95755f2dac6acb0bfd1e9ac5d548
+        with:
+          python-version: ${{ env.PYTHON_VERSION }}
+
+      - name: Install uv
+        uses: astral-sh/setup-uv@803947b9bd8e9f986429fa0c5a41c367cd732b41
+
+      - name: Prepare reports directory
+        run: mkdir -p "${{ env.REPORTS_DIR }}"
+
+      # Discovers every lintable package under consumers/aws/*/ and webhooks/aws/*/ (any dir
+      # with a pyproject.toml) -- unconditionally, regardless of what this PR changed. Lint
+      # always runs against the full package; only the PR-comment mechanism stays per-package.
+      - name: Discover lintable packages
+        id: discover
+        run: |
+          python3 - <<'PY'
+          import json
+          import os
+          from pathlib import Path
+
+          root = Path(os.environ.get("GITHUB_WORKSPACE", ".")).resolve()
+          reports = root / os.environ["REPORTS_DIR"]
+
+          def find_packages(area):
+              base = root / area / "aws"
+              if not base.is_dir():
+                  return []
+              return [
+                  d for d in sorted(base.iterdir(), key=lambda p: p.name)
+                  if d.is_dir() and (d / "pyproject.toml").is_file()
+              ]
+
+          packages = []
+          for area in ("consumers", "webhooks"):
+              for pkg_dir in find_packages(area):
+                  rel_dir = pkg_dir.relative_to(root).as_posix()
+                  packages.append({"area": area, "name": pkg_dir.name, "dir": rel_dir})
+
+          reports.mkdir(parents=True, exist_ok=True)
+          (reports / "lint-manifest.json").write_text(
+              json.dumps({"packages": packages}, indent=2), encoding="utf-8"
+          )
+
+          has_consumers = any(p["area"] == "consumers" for p in packages)
+          with open(os.environ["GITHUB_OUTPUT"], "a", encoding="utf-8") as fh:
+              fh.write("has_packages=" + ("true" if packages else "false") + "\n")
+              fh.write("has_consumers=" + ("true" if has_consumers else "false") + "\n")
+
+          if packages:
+              print("Lintable packages (%d):" % len(packages))
+              for p in packages:
+                  print(" -", p["area"], p["name"])
+          else:
+              print("No lintable packages found under consumers/aws/* or webhooks/aws/*.")
+          PY
+
+      - name: Configure AWS credentials (CodeArtifact)
+        id: aws
+        if: steps.discover.outputs.has_consumers == 'true'
+        continue-on-error: true
+        uses: aws-actions/configure-aws-credentials@61815dcd50bd041e203e49132bacad1fd04d2708
+        with:
+          aws-region: ${{ secrets.AWS_REGION }}
+          role-to-assume: arn:aws:iam::${{ secrets.AWS_ACCOUNT_ID }}:role/github-action-deploy-role
+
+      # Everything below runs on this same runner (no matrix): one AWS/CodeArtifact login is
+      # reused across all consumer packages, then ruff runs once per package against every file
+      # in that package. Failures are recorded into that package's report JSON as {"error": ...}
+      # instead of aborting, so the comment step can still post a clear message.
+      - name: Run ruff for all packages
+        if: steps.discover.outputs.has_packages == 'true'
+        env:
+          AWS_OK: ${{ steps.aws.outcome == 'success' && '1' || '0' }}
+          UV_INDEX_CODEARTIFACT_USERNAME: aws
+        run: |
+          set -uo pipefail
+
+          if [ "${{ steps.discover.outputs.has_consumers }}" = "true" ] && [ "$AWS_OK" = "1" ]; then
+            TOKEN=$(aws codeartifact get-authorization-token \
+              --domain "${{ secrets.CODEARTIFACT_DOMAIN }}" \
+              --domain-owner "${{ secrets.AWS_ACCOUNT_ID }}" \
+              --region "${{ secrets.AWS_REGION }}" \
+              --query authorizationToken --output text)
+            if [ -n "$TOKEN" ]; then
+              export UV_INDEX_CODEARTIFACT_PASSWORD="$TOKEN"
+            else
+              echo "::warning::CodeArtifact token empty; consumer packages will be marked as failed."
+            fi
+          fi
+
+          python3 - <<'PY'
+          import json
+          import os
+          import subprocess
+          from pathlib import Path
+
+          root = Path(os.environ["GITHUB_WORKSPACE"]).resolve()
+          reports = root / os.environ["REPORTS_DIR"]
+          manifest = json.loads((reports / "lint-manifest.json").read_text(encoding="utf-8"))
+          aws_ok = os.environ.get("AWS_OK") == "1"
+          token_set = "UV_INDEX_CODEARTIFACT_PASSWORD" in os.environ
+
+          for pkg in manifest["packages"]:
+              area, name, rel_dir = pkg["area"], pkg["name"], pkg["dir"]
+              report_path = reports / f"lint-{area}-{name}.json"
+
+              if area == "consumers" and not (aws_ok and token_set):
+                  report_path.write_text(
+                      json.dumps({"error": "AWS/CodeArtifact authentication failed"}), encoding="utf-8"
+                  )
+                  continue
+
+              pkg_dir = root / rel_dir
+              print(f"::group::Lint: {area}/{name}")
+              sync = subprocess.run("uv sync --no-install-project --group dev", shell=True, cwd=pkg_dir)
+              if sync.returncode != 0:
+                  report_path.write_text(
+                      json.dumps({"error": "uv sync failed -- see job logs"}), encoding="utf-8"
+                  )
+                  print("::endgroup::")
+                  continue
+
+              with open(report_path, "w", encoding="utf-8") as fh:
+                  subprocess.run(
+                      "uv run ruff check --output-format=json .",
+                      shell=True, cwd=pkg_dir, stdout=fh,
+                  )
+              print("::endgroup::")
+          PY
+
+      # Builds one comment per package: first 5 errors as a table, the rest behind a <details>
+      # dropdown, capped at 300 rows and then further shrunk (byte-size based) so no body ever
+      # exceeds GitHub's comment limit. Writes all bodies + the combined gate result to disk;
+      # posting happens in the next step so a comment API hiccup can't hide a real lint failure.
+      - name: Build lint comments
+        if: always() && steps.discover.outputs.has_packages == 'true'
+        env:
+          GITHUB_COMMENT_MAX_CHARS: ${{ env.GITHUB_COMMENT_MAX_CHARS }}
+        run: |
+          python3 - <<'PY'
+          import json
+          import os
+          from pathlib import Path
+
+          root = Path(os.environ["GITHUB_WORKSPACE"]).resolve()
+          reports = root / os.environ["REPORTS_DIR"]
+          manifest = json.loads((reports / "lint-manifest.json").read_text(encoding="utf-8"))
+
+          MAX_CHARS = int(os.environ.get("GITHUB_COMMENT_MAX_CHARS", "65536"))
+          SAFE_CHARS = MAX_CHARS - 2000  # margin for API overhead
+          SUMMARY_ROWS = 5
+          HARD_CAP = 300
+          MAX_MSG_LEN = 200
+
+          def load_violations(report_path):
+              if not report_path.exists() or report_path.stat().st_size == 0:
+                  return None, "Lint did not produce a report (setup step failed before ruff ran). Check the job logs."
+              raw = report_path.read_text(encoding="utf-8").strip()
+              if not raw:
+                  return [], None
+              try:
+                  data = json.loads(raw)
+              except json.JSONDecodeError:
+                  return None, "Could not parse ruff output:\n\n```\n" + raw[:2000] + "\n```"
+              if isinstance(data, dict) and data.get("error"):
+                  return None, f"Lint could not run: `{data['error']}`."
+              if not isinstance(data, list):
+                  return None, "Unexpected ruff output format."
+              return data, None
+
+          def truncate(msg, n=MAX_MSG_LEN):
+              msg = " ".join(str(msg).split())
+              return msg if len(msg) <= n else msg[: n - 1] + "…"
+
+          def build_comment(pkg):
+              area, name, pkg_dir = pkg["area"], pkg["name"], pkg["dir"]
+              marker = f"<!-- antennae-lint-{area}-{name}-marker -->"
+              report_path = reports / f"lint-{area}-{name}.json"
+              violations, setup_error = load_violations(report_path)
+
+              def rel_file(f):
+                  p = Path(f)
+                  if not p.is_absolute():
+                      p = Path(pkg_dir) / f
+                  p = p.resolve()
+                  try:
+                      return str(p.relative_to(root))
+                  except ValueError:
+                      return str(p)
+
+              rows = []
+              if violations:
+                  for v in violations:
+                      line = (v.get("location") or {}).get("row")
+                      rows.append(
+                          {
+                              "file": rel_file(v.get("filename", "")),
+                              "line": line if isinstance(line, int) else "?",
+                              "code": v.get("code") or "-",
+                              "message": truncate(v.get("message", "")),
+                          }
+                      )
+                  rows.sort(key=lambda r: (r["file"], r["line"] if isinstance(r["line"], int) else 0))
+
+              total = len(rows)
+
+              def render(cap):
+                  md = [f"## Lint ({area}/`{name}`)", ""]
+                  if setup_error:
+                      md += [f"⚠️ **{setup_error}**", "", marker]
+                      return "\n".join(md)
+                  if total == 0:
+                      md += [
+                          "✅ **No lint errors** in this package.",
+                          "",
+                          marker,
+                      ]
+                      return "\n".join(md)
+
+                  md.append(f"❌ **{total} lint error(s)** in this package.")
+                  md.append("")
+                  md.append("| File | Line | Code | Message |")
+                  md.append("|:--|--:|:--|:--|")
+                  for r in rows[:SUMMARY_ROWS]:
+                      md.append(f"| `{r['file']}` | {r['line']} | `{r['code']}` | {r['message']} |")
+
+                  remaining = rows[SUMMARY_ROWS:cap]
+                  if remaining:
+                      md.append("")
+                      md.append("<details>")
+                      md.append(f"<summary>Show {len(remaining)} more error(s)</summary>")
+                      md.append("")
+                      md.append("| File | Line | Code | Message |")
+                      md.append("|:--|--:|:--|:--|")
+                      for r in remaining:
+                          md.append(f"| `{r['file']}` | {r['line']} | `{r['code']}` | {r['message']} |")
+                      md.append("")
+                      md.append("</details>")
+
+                  if cap < total:
+                      reason = "capped for readability" if cap == HARD_CAP else "truncated to fit GitHub's comment size limit"
+                      md.append("")
+                      md.append(f"_Showing {cap} of {total} errors ({reason})._")
+
+                  md.append("")
+                  md.append("Run locally to see all errors in this package:")
+                  md.append("```bash")
+                  md.append(f"cd {pkg_dir}")
+                  md.append("uv run ruff check .")
+                  md.append("```")
+                  md.append("")
+                  md.append(marker)
+                  return "\n".join(md)
+
+              cap = min(total, HARD_CAP)
+              body = render(cap)
+              while len(body) > SAFE_CHARS and cap > SUMMARY_ROWS:
+                  cap = max(SUMMARY_ROWS, cap - max(1, cap // 10))
+                  body = render(cap)
+
+              status = "fail" if (setup_error or total > 0) else "pass"
+              print(f"{area}/{name}: {status} ({total} error(s), showing {min(cap, total)}) -- body {len(body)} chars")
+              return {"area": area, "name": name, "marker": marker, "body": body, "status": status}
+
+          comments = [build_comment(pkg) for pkg in manifest["packages"]]
+          (reports / "lint-comments.json").write_text(json.dumps(comments), encoding="utf-8")
+
+          gate_ok = all(c["status"] == "pass" for c in comments)
+          (reports / "lint_gate_ok").write_text("1" if gate_ok else "0", encoding="utf-8")
+          PY
+
+      # No marketplace comment action here on purpose: this loops over every changed package's
+      # comment in one step on this same runner, finding-or-updating each via the REST API
+      # directly (marker-based, same idempotency peter-evans/find-comment gave us before).
+      - name: Post lint comments
+        if: always() && steps.discover.outputs.has_packages == 'true'
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          PR_NUMBER: ${{ github.event.pull_request.number }}
+        run: |
+          python3 - <<'PY'
+          import json
+          import os
+          import urllib.error
+          import urllib.request
+          from pathlib import Path
+
+          repo = os.environ["GITHUB_REPOSITORY"]
+          pr_number = os.environ["PR_NUMBER"]
+          reports = Path(os.environ["GITHUB_WORKSPACE"]) / os.environ["REPORTS_DIR"]
+          comments = json.loads((reports / "lint-comments.json").read_text(encoding="utf-8"))
+
+          headers = {
+              "Authorization": f"Bearer {os.environ['GITHUB_TOKEN']}",
+              "Accept": "application/vnd.github+json",
+              "X-GitHub-Api-Version": "2022-11-28",
+              "User-Agent": "antennae-lint-bot",
+          }
+
+          def call(method, url, payload=None):
+              data = json.dumps(payload).encode("utf-8") if payload is not None else None
+              req = urllib.request.Request(url, data=data, headers=headers, method=method)
+              try:
+                  with urllib.request.urlopen(req) as resp:
+                      body = resp.read()
+                      return (json.loads(body) if body else None), resp.headers
+              except urllib.error.URLError as e:
+                  print(f"::warning::Comment API call failed ({method} {url}): {e}")
+                  return None, {}
+
+          def list_existing_comments():
+              existing = []
+              url = f"https://api.github.com/repos/{repo}/issues/{pr_number}/comments?per_page=100"
+              while url:
+                  data, resp_headers = call("GET", url)
+                  existing.extend(data or [])
+                  url = None
+                  for part in (resp_headers.get("Link") or "").split(","):
+                      if 'rel="next"' in part:
+                          url = part.split(";")[0].strip().strip("<>")
+              return existing
+
+          existing = list_existing_comments()
+
+          for c in comments:
+              match = next(
+                  (
+                      e for e in existing
+                      if e.get("user", {}).get("login") == "github-actions[bot]" and c["marker"] in e.get("body", "")
+                  ),
+                  None,
+              )
+              if match:
+                  call("PATCH", f"https://api.github.com/repos/{repo}/issues/comments/{match['id']}", {"body": c["body"]})
+                  print(f"Updated comment for {c['area']}/{c['name']}")
+              else:
+                  call("POST", f"https://api.github.com/repos/{repo}/issues/{pr_number}/comments", {"body": c["body"]})
+                  print(f"Created comment for {c['area']}/{c['name']}")
+          PY
+
+      - name: Quality gate
+        if: always()
+        run: |
+          if [ "${{ steps.discover.outputs.has_packages }}" != "true" ]; then
+            echo "No lintable packages found under consumers/aws/* or webhooks/aws/* -- nothing to lint."
+            exit 0
+          fi
+          GATE_FILE="${{ env.REPORTS_DIR }}/lint_gate_ok"
+          if [ ! -f "$GATE_FILE" ] || [ "$(cat "$GATE_FILE")" != "1" ]; then
+            echo "::error::Lint failed for one or more packages. See PR comments."
+            exit 1
+          fi
+          echo "Lint passed for all packages."
