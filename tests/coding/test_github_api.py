@@ -92,3 +92,83 @@ def test_get_default_branch(monkeypatch):
         github_api.httpx, "get", lambda url, **kw: _Resp({"default_branch": "master"})
     )
     assert github_api.get_default_branch("o/r", token="t") == "master"
+
+
+def test_branch_exists_true_and_false(monkeypatch):
+    monkeypatch.setattr(github_api.httpx, "get", lambda url, **kw: _Resp({}, 200))
+    assert github_api.branch_exists("o/r", "develop", token="t") is True
+    monkeypatch.setattr(github_api.httpx, "get", lambda url, **kw: _Resp({}, 404))
+    assert github_api.branch_exists("o/r", "develop", token="t") is False
+
+
+def test_branch_exists_raises_on_other_errors(monkeypatch):
+    monkeypatch.setattr(github_api.httpx, "get", lambda url, **kw: _Resp({}, 500))
+    with pytest.raises(github_api.GitHubApiError):
+        github_api.branch_exists("o/r", "develop", token="t")
+
+
+def test_ensure_branch_creates_missing_branch_at_given_sha(monkeypatch):
+    monkeypatch.setattr(github_api, "branch_exists", lambda *a, **kw: False)
+    posts = []
+    monkeypatch.setattr(
+        github_api.httpx,
+        "post",
+        lambda url, headers=None, json=None, timeout=None: posts.append((url, json))
+        or _Resp({"sha": "x"}),
+    )
+
+    assert github_api.ensure_branch("o/r", "develop", "sha1", token="t") is True
+    assert posts[0][0].endswith("/repos/o/r/git/refs")
+    assert posts[0][1] == {"ref": "refs/heads/develop", "sha": "sha1"}
+
+
+def test_ensure_branch_leaves_existing_branch_alone(monkeypatch):
+    monkeypatch.setattr(github_api, "branch_exists", lambda *a, **kw: True)
+    monkeypatch.setattr(
+        github_api.httpx, "post", lambda *a, **kw: pytest.fail("must not create an existing branch")
+    )
+    assert github_api.ensure_branch("o/r", "develop", "sha1", token="t") is False
+
+
+def test_create_pull_request_error_includes_github_message(monkeypatch):
+    monkeypatch.setattr(
+        github_api.httpx,
+        "post",
+        lambda *a, **kw: _Resp({"message": "Validation Failed", "errors": ["base invalid"]}, 422),
+    )
+    with pytest.raises(github_api.GitHubApiError, match="base invalid"):
+        github_api.create_pull_request("o/r", "fix/x", "develop", "t", "b", token="t")
+
+
+def test_plain_slug_uses_github_com_by_default(monkeypatch):
+    monkeypatch.delenv("GITHUB_API_URL", raising=False)
+    assert github_api._target("o/r") == ("https://api.github.com", "o/r")
+
+
+def test_plain_slug_uses_github_api_url_when_set(monkeypatch):
+    monkeypatch.setenv("GITHUB_API_URL", "https://github.asurint.com/api/v3/")
+    assert github_api._target("keystone/ui") == ("https://github.asurint.com/api/v3", "keystone/ui")
+
+
+def test_full_enterprise_url_derives_its_own_api_base(monkeypatch):
+    monkeypatch.setenv("GITHUB_API_URL", "https://ignored.example/api/v3")
+    base, slug = github_api._target("https://github.asurint.com/keystone/reports-api.git")
+    assert (base, slug) == ("https://github.asurint.com/api/v3", "keystone/reports-api")
+
+
+def test_full_github_com_url_uses_public_api():
+    assert github_api._target("https://github.com/o/r/") == ("https://api.github.com", "o/r")
+
+
+def test_requests_go_to_the_enterprise_host(monkeypatch):
+    seen = {}
+
+    def fake_get(url, **kw):
+        seen["url"] = url
+        return _Resp({"default_branch": "develop"})
+
+    monkeypatch.setattr(github_api.httpx, "get", fake_get)
+    monkeypatch.setenv("GITHUB_API_URL", "https://github.asurint.com/api/v3")
+
+    assert github_api.get_default_branch("keystone/reports-api", token="t") == "develop"
+    assert seen["url"] == "https://github.asurint.com/api/v3/repos/keystone/reports-api"

@@ -132,3 +132,34 @@ def test_missing_function_or_symbol_is_skipped(tmp_path):
     verified, skipped = verify_changes_for_service("orders", spec, tmp_path, [change])
     assert verified == []
     assert "missing file_path or function_or_symbol" in skipped[0].reason
+
+
+def test_path_escaping_the_repo_is_skipped_for_every_change_type(tmp_path):
+    repo = tmp_path / "repo"
+    repo.mkdir()
+    (tmp_path / "secret.txt").write_text("outside")
+    spec = ServiceSpec(name="orders", repo="org/orders")
+    bad_paths = ["../secret.txt", "../../etc/passwd", str(tmp_path / "secret.txt")]
+    changes = [
+        _change(file_path=p, change_type=t)
+        for p in bad_paths
+        for t in ("modify", "create", "delete")
+    ]
+
+    verified, skipped = verify_changes_for_service("orders", spec, repo, changes)
+
+    assert verified == []
+    assert len(skipped) == len(changes)
+    assert all("outside the repository" in s.reason for s in skipped)
+
+
+def test_nested_path_inside_the_repo_is_still_verified(tmp_path):
+    (tmp_path / "src" / "main").mkdir(parents=True)
+    (tmp_path / "src" / "main" / "A.java").write_text("class A {}")
+    spec = ServiceSpec(name="orders", repo="org/orders")
+
+    verified, skipped = verify_changes_for_service(
+        "orders", spec, tmp_path, [_change(file_path="src/main/A.java")]
+    )
+
+    assert len(verified) == 1 and skipped == []

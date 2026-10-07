@@ -5,16 +5,23 @@ branch + commit through the Git Data API, and opening a Pull Request.
 
 Auth: GITHUB_TOKEN (needs Contents + Pull requests read/write on the repo,
 or the classic `repo` scope), optional only for read-only public access.
+
+Which GitHub: a plain "owner/repo" slug goes to GITHUB_API_URL (default
+https://api.github.com). For GitHub Enterprise Server set it to
+https://<host>/api/v3, or store the repo as a full URL such as
+https://github.asurint.com/keystone/reports-api and the API address is
+derived from its host. One GITHUB_TOKEN is sent to whichever host is used.
 """
 
 from __future__ import annotations
 
 import base64
 import os
+from urllib.parse import urlparse
 
 import httpx
 
-_API_BASE = "https://api.github.com"
+_API_BASE = "https://api.github.com"  # the default; see _target()
 _TIMEOUT = 30
 _DOWNLOAD_TIMEOUT = 120
 
@@ -22,6 +29,25 @@ _DOWNLOAD_TIMEOUT = 120
 class GitHubApiError(Exception):
     """Raised on any GitHub API failure — callers must catch this and skip
     this service's sync for the run, never let it abort the whole run."""
+
+
+def _target(repo: str) -> tuple[str, str]:
+    """(api_base, "owner/repo") for `repo`. A full repo URL names its own
+    host: github.com uses the public API, any other host is treated as GitHub
+    Enterprise Server (<scheme>://<host>/api/v3). A plain slug uses
+    GITHUB_API_URL, else api.github.com."""
+    if repo.startswith(("http://", "https://")):
+        parsed = urlparse(repo)
+        slug = parsed.path.strip("/").removesuffix(".git")
+        if parsed.netloc in ("github.com", "www.github.com"):
+            return _API_BASE, slug
+        return f"{parsed.scheme}://{parsed.netloc}/api/v3", slug
+    return (os.environ.get("GITHUB_API_URL") or _API_BASE).rstrip("/"), repo
+
+
+def _repo_api(repo: str, suffix: str = "") -> str:
+    base, slug = _target(repo)
+    return f"{base}/repos/{slug}{suffix}"
 
 
 def _headers(token: str | None) -> dict:
@@ -36,7 +62,7 @@ def get_remote_head_sha(repo: str, branch: str | None = None, token: str | None 
     """The current HEAD commit sha of `repo`'s `branch`, or its default
     branch when `branch` is None — a single lightweight API call, no clone."""
     ref = branch or "HEAD"
-    url = f"{_API_BASE}/repos/{repo}/commits/{ref}"
+    url = _repo_api(repo, f"/commits/{ref}")
     try:
         resp = httpx.get(url, headers=_headers(token), timeout=_TIMEOUT)
         resp.raise_for_status()
@@ -60,7 +86,7 @@ def get_changed_files(repo: str, base: str, head: str, token: str | None = None)
     Known limitation: GitHub's compare API paginates at 300 changed files
     per response; a diff larger than that returns only the first page here.
     """
-    url = f"{_API_BASE}/repos/{repo}/compare/{base}...{head}"
+    url = _repo_api(repo, f"/compare/{base}...{head}")
     try:
         resp = httpx.get(url, headers=_headers(token), timeout=_TIMEOUT)
         resp.raise_for_status()
@@ -87,7 +113,7 @@ def get_changed_files(repo: str, base: str, head: str, token: str | None = None)
 def fetch_file_content(repo: str, path: str, ref: str, token: str | None = None) -> str:
     """Raw text content of one file at `ref`, via GitHub's Contents API —
     fetches exactly this one file, never the whole repo."""
-    url = f"{_API_BASE}/repos/{repo}/contents/{path}"
+    url = _repo_api(repo, f"/contents/{path}")
     try:
         resp = httpx.get(url, headers=_headers(token), params={"ref": ref}, timeout=_TIMEOUT)
         resp.raise_for_status()
@@ -108,19 +134,49 @@ def create_pull_request(
     """Opens a PR from `head` (the branch the coding agent just pushed) into
     `base` (the service's default/manifest branch) — never a merge, always a
     PR for human review. Returns the PR's html_url."""
-    url = f"{_API_BASE}/repos/{repo}/pulls"
+    url = _repo_api(repo, "/pulls")
     payload = {"title": title, "body": body, "head": head, "base": base}
     try:
         resp = httpx.post(url, headers=_headers(token), json=payload, timeout=_TIMEOUT)
         resp.raise_for_status()
     except httpx.HTTPError as e:
-        raise GitHubApiError(f"could not open PR for {repo} {head}->{base}: {e}") from e
+        raise GitHubApiError(f"could not open PR for {repo} {head}->{base}: {_describe(e)}") from e
     return resp.json()["html_url"]
+
+
+def branch_exists(repo: str, branch: str, token: str | None = None) -> bool:
+    """Whether `branch` exists in `repo` — a 404 means no, anything else
+    unexpected is an error rather than a guess."""
+    url = _repo_api(repo, f"/branches/{branch}")
+    try:
+        resp = httpx.get(url, headers=_headers(token), timeout=_TIMEOUT)
+        if resp.status_code == 404:
+            return False
+        resp.raise_for_status()
+    except httpx.HTTPError as e:
+        raise GitHubApiError(f"could not check branch {branch} in {repo}: {_describe(e)}") from e
+    return True
+
+
+def ensure_branch(repo: str, branch: str, from_sha: str, token: str | None = None) -> bool:
+    """Makes sure `branch` exists, creating it at `from_sha` when it doesn't.
+    Returns True if it had to be created. Never moves or overwrites a
+    branch that already exists."""
+    if branch_exists(repo, branch, token):
+        return False
+    _post(
+        repo,
+        "/git/refs",
+        {"ref": f"refs/heads/{branch}", "sha": from_sha},
+        token,
+        f"create branch {branch}",
+    )
+    return True
 
 
 def get_default_branch(repo: str, token: str | None = None) -> str:
     """The repo's real default branch (main/master/...), never a guess."""
-    url = f"{_API_BASE}/repos/{repo}"
+    url = _repo_api(repo)
     try:
         resp = httpx.get(url, headers=_headers(token), timeout=_TIMEOUT)
         resp.raise_for_status()
@@ -134,7 +190,7 @@ def download_zipball(
 ) -> bytes:
     """The repo's files at `ref` (a commit sha or branch) as zip bytes —
     replaces `git clone`. GitHub answers with a redirect to the archive."""
-    url = f"{_API_BASE}/repos/{repo}/zipball/{ref}"
+    url = _repo_api(repo, f"/zipball/{ref}")
     try:
         resp = httpx.get(url, headers=_headers(token), timeout=timeout, follow_redirects=True)
         resp.raise_for_status()
@@ -152,10 +208,10 @@ def _describe(error: httpx.HTTPError) -> str:
     return str(error)
 
 
-def _post(path: str, payload: dict, token: str | None, what: str) -> dict:
+def _post(repo: str, suffix: str, payload: dict, token: str | None, what: str) -> dict:
     try:
         resp = httpx.post(
-            f"{_API_BASE}{path}", headers=_headers(token), json=payload, timeout=_TIMEOUT
+            _repo_api(repo, suffix), headers=_headers(token), json=payload, timeout=_TIMEOUT
         )
         resp.raise_for_status()
     except httpx.HTTPError as e:
@@ -178,7 +234,7 @@ def create_branch_commit(
     exists fails with 422). Returns the new commit's sha."""
     try:
         resp = httpx.get(
-            f"{_API_BASE}/repos/{repo}/git/commits/{base_sha}",
+            _repo_api(repo, f"/git/commits/{base_sha}"),
             headers=_headers(token),
             timeout=_TIMEOUT,
         )
@@ -193,7 +249,8 @@ def create_branch_commit(
             sha = None
         else:
             blob = _post(
-                f"/repos/{repo}/git/blobs",
+                repo,
+                "/git/blobs",
                 {"content": f["content"], "encoding": "utf-8"},
                 token,
                 f"create blob for {f['path']}",
@@ -202,16 +259,18 @@ def create_branch_commit(
         entries.append({"path": f["path"], "mode": f["mode"], "type": "blob", "sha": sha})
 
     tree = _post(
-        f"/repos/{repo}/git/trees", {"base_tree": base_tree, "tree": entries}, token, "create tree"
+        repo, "/git/trees", {"base_tree": base_tree, "tree": entries}, token, "create tree"
     )
     commit = _post(
-        f"/repos/{repo}/git/commits",
+        repo,
+        "/git/commits",
         {"message": message, "tree": tree["sha"], "parents": [base_sha]},
         token,
         "create commit",
     )
     _post(
-        f"/repos/{repo}/git/refs",
+        repo,
+        "/git/refs",
         {"ref": f"refs/heads/{branch}", "sha": commit["sha"]},
         token,
         f"create branch {branch}",

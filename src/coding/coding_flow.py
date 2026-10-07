@@ -182,6 +182,15 @@ async def run_coding_agent(
 
                 verification = test_runner.run_tests(repo_root)
 
+                # The repo's REAL default branch (main, master, ...), never
+                # a hardcoded guess, unless a base was asked for explicitly.
+                base = base_branch_by_service.get(service) or spec.branch or checkout.default_branch
+                if base != checkout.default_branch:
+                    # An explicitly requested base that doesn't exist yet
+                    # (e.g. "develop") is created from the checked-out commit,
+                    # before the fix branch, so a failure leaves nothing behind.
+                    github_api.ensure_branch(spec.repo, base, checkout.head_sha)
+
                 new_branch = repo_ops.branch_name(tdd.issue_summary, run_id)
                 repo_ops.commit_patches(
                     spec.repo,
@@ -191,10 +200,6 @@ async def run_coding_agent(
                     f"fix: {tdd.title}",
                     to_commit,
                 )
-                # The repo's REAL default branch (main, master, ...), never
-                # a hardcoded guess — a wrong base makes create_pull_request
-                # fail with a 422 the caller can't recover from.
-                base = base_branch_by_service.get(service) or spec.branch or checkout.default_branch
                 pr_url = github_api.create_pull_request(
                     spec.repo,
                     head=new_branch,

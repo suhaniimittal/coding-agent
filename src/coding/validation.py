@@ -20,6 +20,15 @@ from .models import SkippedChange, VerifiedChange
 from .tdd_models import TechnicalDesignDoc
 
 
+def _is_inside_repo(repo_root: Path, file_path: str) -> bool:
+    """A TDD's file_path must name a file INSIDE the downloaded repo — an
+    absolute path or one with `..` could otherwise read or write elsewhere on
+    the machine, since the path comes from LLM-extracted document text."""
+    root = repo_root.resolve()
+    target = (root / file_path).resolve()
+    return target == root or root in target.parents
+
+
 def verify_changes_for_service(
     service_plan_service: str, spec: ServiceSpec, repo_root: Path, changes
 ) -> tuple[list[VerifiedChange], list[SkippedChange]]:
@@ -46,6 +55,16 @@ def verify_changes_for_service(
     skipped: list[SkippedChange] = []
 
     for change in changes:
+        if change.file_path and not _is_inside_repo(repo_root, change.file_path):
+            skipped.append(
+                SkippedChange(
+                    service_plan_service,
+                    change,
+                    f"file_path {change.file_path!r} is outside the repository",
+                )
+            )
+            continue
+
         if change.change_type == "create":
             if not change.file_path:
                 skipped.append(

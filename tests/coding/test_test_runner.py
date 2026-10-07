@@ -88,3 +88,25 @@ def test_run_tests_reports_missing_executable_without_crashing(tmp_path, monkeyp
     assert result.ran is False
     assert result.passed is False
     assert "could not run" in result.detail
+
+
+def test_run_tests_does_not_pass_secrets_to_the_repos_test_process(tmp_path, monkeypatch):
+    (tmp_path / "requirements.txt").write_text("")
+    for name in ("GITHUB_TOKEN", "NEO4J_PASSWORD", "OPENAI_API_KEY", "AGENTS_GATEWAY_KEY",
+                 "AWS_ROLE_ARN", "STORAGE_SECRET_KEY", "TENANT_ID"):
+        monkeypatch.setenv(name, "secret")
+    monkeypatch.setenv("PATH", "/usr/bin")
+    seen = {}
+
+    def fake_run(cmd, **kwargs):
+        seen["env"] = kwargs["env"]
+        return subprocess.CompletedProcess(cmd, 0, stdout="ok", stderr="")
+
+    monkeypatch.setattr(subprocess, "run", fake_run)
+
+    test_runner.run_tests(tmp_path)
+
+    assert seen["env"]["PATH"] == "/usr/bin"
+    for name in ("GITHUB_TOKEN", "NEO4J_PASSWORD", "OPENAI_API_KEY", "AGENTS_GATEWAY_KEY",
+                 "AWS_ROLE_ARN", "STORAGE_SECRET_KEY", "TENANT_ID"):
+        assert name not in seen["env"]

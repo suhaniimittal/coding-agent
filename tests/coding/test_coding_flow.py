@@ -363,3 +363,50 @@ async def test_pr_failure_is_skipped_not_raised(tmp_path, monkeypatch):
 
     assert result["pull_requests"] == []
     assert "GitHubApiError" in result["skipped"][0].reason
+
+
+@pytest.mark.asyncio
+async def test_missing_requested_base_branch_is_created_before_the_fix_branch(tmp_path, monkeypatch):
+    _one_file_patch_setup(tmp_path, monkeypatch)
+    order = []
+    monkeypatch.setattr(
+        coding_flow.github_api,
+        "ensure_branch",
+        lambda repo, branch, sha, token=None: order.append(("ensure", repo, branch, sha)),
+    )
+    monkeypatch.setattr(
+        coding_flow.repo_ops,
+        "commit_patches",
+        lambda *a, **kw: order.append(("commit",)) or "sha",
+    )
+    prs = {}
+
+    def fake_pr(repo, head, base, title, body, token=None):
+        prs["base"] = base
+        return "https://github.com/org/orders/pull/9"
+
+    monkeypatch.setattr(coding_flow.github_api, "create_pull_request", fake_pr)
+
+    result = await coding_flow.run_coding_agent(
+        _tdd(_change()), base_branch_by_service={"orders": "develop"}
+    )
+
+    assert order == [("ensure", "org/orders", "develop", "basesha123"), ("commit",)]
+    assert prs["base"] == "develop"
+    assert len(result["pull_requests"]) == 1
+
+
+@pytest.mark.asyncio
+async def test_default_base_branch_is_never_created(tmp_path, monkeypatch):
+    _one_file_patch_setup(tmp_path, monkeypatch)
+    _stub_commit(monkeypatch)
+    monkeypatch.setattr(
+        coding_flow.github_api,
+        "ensure_branch",
+        lambda *a, **kw: pytest.fail("default branch needs no creation"),
+    )
+    monkeypatch.setattr(
+        coding_flow.github_api, "create_pull_request", lambda *a, **kw: "https://x/pull/1"
+    )
+
+    await coding_flow.run_coding_agent(_tdd(_change()))
