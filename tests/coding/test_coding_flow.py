@@ -64,6 +64,13 @@ def _stub_commit(monkeypatch):
 _SPEC = ServiceSpec(name="orders", repo="org/orders")
 
 
+@pytest.fixture(autouse=True)
+def _pr_mode_for_legacy_tests(monkeypatch):
+    """Most tests here were written for PR mode; branch-only (the default)
+    has its own tests at the bottom, which switch this off."""
+    monkeypatch.setenv("OPEN_PULL_REQUEST", "true")
+
+
 def _resolve_orders(monkeypatch):
     monkeypatch.setattr(coding_flow, "resolve_services", lambda tdd: ({"orders": _SPEC}, []))
 
@@ -79,7 +86,13 @@ async def test_happy_path_opens_pr(tmp_path, monkeypatch):
 
     async def fake_generate_service_patch(service, changes, file_contents):
         assert file_contents == {"OrderService.java": "class OrderService {}\n"}
-        patch = FilePatch(service, "OrderService.java", "modify", "class OrderService { /* fixed */ }", ["propagate payment failure"])
+        patch = FilePatch(
+            service,
+            "OrderService.java",
+            "modify",
+            "class OrderService { /* fixed */ }",
+            ["propagate payment failure"],
+        )
         return [patch], []
 
     monkeypatch.setattr(coding_flow.patcher, "generate_service_patch", fake_generate_service_patch)
@@ -97,8 +110,8 @@ async def test_happy_path_opens_pr(tmp_path, monkeypatch):
     result = await coding_flow.run_coding_agent(tdd)
 
     assert result["skipped"] == []
-    assert len(result["pull_requests"]) == 1
-    pr = result["pull_requests"][0]
+    assert len(result["branches"]) == 1
+    pr = result["branches"][0]
     assert pr["service"] == "orders"
     assert pr["pr_url"] == "https://github.com/org/orders/pull/1"
     assert pr["verification"].ran is False  # no test command marker present in tmp_path
@@ -122,11 +135,15 @@ async def test_change_rejected_by_real_clone_check_is_skipped_not_pr_opened(tmp_
 
     _resolve_orders(monkeypatch)
     monkeypatch.setattr(coding_flow, "cloned_repo", _fake_cloned_repo(tmp_path))
-    monkeypatch.setattr(coding_flow.github_api, "create_pull_request", lambda *a, **kw: pytest.fail("should not open a PR"))
+    monkeypatch.setattr(
+        coding_flow.github_api,
+        "create_pull_request",
+        lambda *a, **kw: pytest.fail("should not open a PR"),
+    )
 
     result = await coding_flow.run_coding_agent(tdd)
 
-    assert result["pull_requests"] == []
+    assert result["branches"] == []
     assert len(result["skipped"]) == 1
     assert "not found in the current clone" in result["skipped"][0].reason
 
@@ -141,18 +158,26 @@ async def test_no_pr_when_patch_content_unchanged(tmp_path, monkeypatch):
     monkeypatch.setattr(coding_flow, "cloned_repo", _fake_cloned_repo(tmp_path))
 
     async def fake_generate_service_patch(service, changes, file_contents):
-        patch = FilePatch(service, "OrderService.java", "modify", file_contents["OrderService.java"], ["no-op"])
+        patch = FilePatch(
+            service, "OrderService.java", "modify", file_contents["OrderService.java"], ["no-op"]
+        )
         return [patch], []
 
     monkeypatch.setattr(coding_flow.patcher, "generate_service_patch", fake_generate_service_patch)
 
     called = {"commit": False, "pr": False}
-    monkeypatch.setattr(coding_flow.repo_ops, "commit_patches", lambda *a, **kw: called.__setitem__("commit", True))
-    monkeypatch.setattr(coding_flow.github_api, "create_pull_request", lambda *a, **kw: called.__setitem__("pr", True))
+    monkeypatch.setattr(
+        coding_flow.repo_ops, "commit_patches", lambda *a, **kw: called.__setitem__("commit", True)
+    )
+    monkeypatch.setattr(
+        coding_flow.github_api,
+        "create_pull_request",
+        lambda *a, **kw: called.__setitem__("pr", True),
+    )
 
     result = await coding_flow.run_coding_agent(tdd)
 
-    assert result["pull_requests"] == []
+    assert result["branches"] == []
     assert called == {"commit": False, "pr": False}
 
 
@@ -168,12 +193,18 @@ async def test_patcher_error_is_skipped_not_raised(tmp_path, monkeypatch):
     async def failing_generate_service_patch(*a, **kw):
         raise coding_flow.patcher.PatcherError("LLM call failed: provider down")
 
-    monkeypatch.setattr(coding_flow.patcher, "generate_service_patch", failing_generate_service_patch)
-    monkeypatch.setattr(coding_flow.github_api, "create_pull_request", lambda *a, **kw: pytest.fail("should not open a PR"))
+    monkeypatch.setattr(
+        coding_flow.patcher, "generate_service_patch", failing_generate_service_patch
+    )
+    monkeypatch.setattr(
+        coding_flow.github_api,
+        "create_pull_request",
+        lambda *a, **kw: pytest.fail("should not open a PR"),
+    )
 
     result = await coding_flow.run_coding_agent(tdd)
 
-    assert result["pull_requests"] == []
+    assert result["branches"] == []
     assert len(result["skipped"]) == 1
     assert "provider down" in result["skipped"][0].reason
 
@@ -191,11 +222,15 @@ async def test_missing_file_in_llm_response_is_skipped(tmp_path, monkeypatch):
         return [], ["OrderService.java"]
 
     monkeypatch.setattr(coding_flow.patcher, "generate_service_patch", fake_generate_service_patch)
-    monkeypatch.setattr(coding_flow.github_api, "create_pull_request", lambda *a, **kw: pytest.fail("should not open a PR"))
+    monkeypatch.setattr(
+        coding_flow.github_api,
+        "create_pull_request",
+        lambda *a, **kw: pytest.fail("should not open a PR"),
+    )
 
     result = await coding_flow.run_coding_agent(tdd)
 
-    assert result["pull_requests"] == []
+    assert result["branches"] == []
     assert len(result["skipped"]) == 1
     assert "missing content" in result["skipped"][0].reason
 
@@ -215,7 +250,7 @@ async def test_unresolved_service_never_gets_cloned(tmp_path, monkeypatch):
 
     result = await coding_flow.run_coding_agent(tdd)
 
-    assert result["pull_requests"] == []
+    assert result["branches"] == []
     assert result["skipped"] == pre_skipped
 
 
@@ -244,16 +279,31 @@ async def test_single_llm_call_for_multiple_files_in_one_service(tmp_path, monke
         call_count["n"] += 1
         assert len(changes) == 2
         return [
-            FilePatch(service, "OrderService.java", "modify", "class OrderService { /* fixed */ }", ["propagate payment failure"]),
-            FilePatch(service, "Other.java", "modify", "class Other { /* fixed */ }", ["propagate payment failure"]),
+            FilePatch(
+                service,
+                "OrderService.java",
+                "modify",
+                "class OrderService { /* fixed */ }",
+                ["propagate payment failure"],
+            ),
+            FilePatch(
+                service,
+                "Other.java",
+                "modify",
+                "class Other { /* fixed */ }",
+                ["propagate payment failure"],
+            ),
         ], []
 
     monkeypatch.setattr(coding_flow.patcher, "generate_service_patch", fake_generate_service_patch)
     _stub_commit(monkeypatch)
+    monkeypatch.setenv("RUN_LOCAL_TESTS", "true")  # opt back in for this test
     monkeypatch.setattr(
         coding_flow.test_runner,
         "run_tests",
-        lambda repo_root, timeout=300: VerificationResult(ran=True, passed=False, detail="AssertionError: boom"),
+        lambda repo_root, timeout=300: VerificationResult(
+            ran=True, passed=False, detail="AssertionError: boom"
+        ),
     )
 
     created_pr = {}
@@ -267,8 +317,8 @@ async def test_single_llm_call_for_multiple_files_in_one_service(tmp_path, monke
     result = await coding_flow.run_coding_agent(tdd)
 
     assert call_count["n"] == 1  # one call for the whole service, not per file
-    assert len(result["pull_requests"]) == 1
-    assert result["pull_requests"][0]["verification"].passed is False
+    assert len(result["branches"]) == 1
+    assert result["branches"][0]["verification"].passed is False
     assert "FAILED" in created_pr["body"]
 
 
@@ -285,7 +335,13 @@ async def test_pr_base_uses_repos_real_default_branch_not_hardcoded_main(tmp_pat
     monkeypatch.setattr(coding_flow, "cloned_repo", _fake_cloned_repo(tmp_path, "master"))
 
     async def fake_generate_service_patch(service, changes, file_contents):
-        patch = FilePatch(service, "OrderService.java", "modify", "class OrderService { /* fixed */ }", ["propagate payment failure"])
+        patch = FilePatch(
+            service,
+            "OrderService.java",
+            "modify",
+            "class OrderService { /* fixed */ }",
+            ["propagate payment failure"],
+        )
         return [patch], []
 
     monkeypatch.setattr(coding_flow.patcher, "generate_service_patch", fake_generate_service_patch)
@@ -310,7 +366,9 @@ def _one_file_patch_setup(tmp_path, monkeypatch):
     monkeypatch.setattr(coding_flow, "cloned_repo", _fake_cloned_repo(tmp_path))
 
     async def fake_generate_service_patch(service, changes, file_contents):
-        patch = FilePatch(service, "OrderService.java", "modify", "class OrderService { /* fixed */ }", ["x"])
+        patch = FilePatch(
+            service, "OrderService.java", "modify", "class OrderService { /* fixed */ }", ["x"]
+        )
         return [patch], []
 
     monkeypatch.setattr(coding_flow.patcher, "generate_service_patch", fake_generate_service_patch)
@@ -328,7 +386,7 @@ async def test_download_failure_is_skipped_not_raised(tmp_path, monkeypatch):
 
     result = await coding_flow.run_coding_agent(_tdd(change))
 
-    assert result["pull_requests"] == []
+    assert result["branches"] == []
     assert len(result["skipped"]) == 1
     assert "RepoFetchError" in result["skipped"][0].reason
 
@@ -341,11 +399,15 @@ async def test_commit_failure_is_skipped_and_no_pr_opened(tmp_path, monkeypatch)
         raise coding_flow.repo_ops.RepoOpsError("could not create branch: 403 Forbidden")
 
     monkeypatch.setattr(coding_flow.repo_ops, "commit_patches", failing_commit)
-    monkeypatch.setattr(coding_flow.github_api, "create_pull_request", lambda *a, **kw: pytest.fail("should not open a PR"))
+    monkeypatch.setattr(
+        coding_flow.github_api,
+        "create_pull_request",
+        lambda *a, **kw: pytest.fail("should not open a PR"),
+    )
 
     result = await coding_flow.run_coding_agent(_tdd(_change()))
 
-    assert result["pull_requests"] == []
+    assert result["branches"] == []
     assert "403 Forbidden" in result["skipped"][0].reason
 
 
@@ -361,52 +423,163 @@ async def test_pr_failure_is_skipped_not_raised(tmp_path, monkeypatch):
 
     result = await coding_flow.run_coding_agent(_tdd(_change()))
 
-    assert result["pull_requests"] == []
+    assert result["branches"] == []
     assert "GitHubApiError" in result["skipped"][0].reason
 
 
 @pytest.mark.asyncio
-async def test_missing_requested_base_branch_is_created_before_the_fix_branch(tmp_path, monkeypatch):
-    _one_file_patch_setup(tmp_path, monkeypatch)
-    order = []
-    monkeypatch.setattr(
-        coding_flow.github_api,
-        "ensure_branch",
-        lambda repo, branch, sha, token=None: order.append(("ensure", repo, branch, sha)),
-    )
-    monkeypatch.setattr(
-        coding_flow.repo_ops,
-        "commit_patches",
-        lambda *a, **kw: order.append(("commit",)) or "sha",
-    )
-    prs = {}
+async def test_create_on_existing_file_sends_its_current_content_to_the_llm(tmp_path, monkeypatch):
+    _init_repo(tmp_path)  # OrderService.java already exists
+    _resolve_orders(monkeypatch)
+    monkeypatch.setattr(coding_flow, "cloned_repo", _fake_cloned_repo(tmp_path))
+    seen = {}
 
-    def fake_pr(repo, head, base, title, body, token=None):
-        prs["base"] = base
-        return "https://github.com/org/orders/pull/9"
+    async def fake_generate_service_patch(service, changes, file_contents):
+        seen["contents"] = file_contents
+        seen["type"] = changes[0].change.change_type
+        return [
+            FilePatch(
+                service, "OrderService.java", "modify", "class OrderService { int x; }", ["x"]
+            )
+        ], []
 
-    monkeypatch.setattr(coding_flow.github_api, "create_pull_request", fake_pr)
-
-    result = await coding_flow.run_coding_agent(
-        _tdd(_change()), base_branch_by_service={"orders": "develop"}
-    )
-
-    assert order == [("ensure", "org/orders", "develop", "basesha123"), ("commit",)]
-    assert prs["base"] == "develop"
-    assert len(result["pull_requests"]) == 1
-
-
-@pytest.mark.asyncio
-async def test_default_base_branch_is_never_created(tmp_path, monkeypatch):
-    _one_file_patch_setup(tmp_path, monkeypatch)
+    monkeypatch.setattr(coding_flow.patcher, "generate_service_patch", fake_generate_service_patch)
     _stub_commit(monkeypatch)
-    monkeypatch.setattr(
-        coding_flow.github_api,
-        "ensure_branch",
-        lambda *a, **kw: pytest.fail("default branch needs no creation"),
-    )
     monkeypatch.setattr(
         coding_flow.github_api, "create_pull_request", lambda *a, **kw: "https://x/pull/1"
     )
 
-    await coding_flow.run_coding_agent(_tdd(_change()))
+    await coding_flow.run_coding_agent(_tdd(_change(change_type="create")))
+
+    assert seen["type"] == "modify"
+    assert seen["contents"] == {"OrderService.java": "class OrderService {}\n"}
+
+
+def _named_branch_setup(tmp_path, monkeypatch, exists=False):
+    _one_file_patch_setup(tmp_path, monkeypatch)
+    committed = _stub_commit(monkeypatch)
+    prs = {}
+
+    def fake_pr(repo, head, base, title, body, token=None):
+        prs.update(head=head, base=base)
+        return "https://x/pull/7"
+
+    monkeypatch.setattr(coding_flow.github_api, "create_pull_request", fake_pr)
+    monkeypatch.setattr(coding_flow.github_api, "branch_exists", lambda repo, b, token=None: exists)
+    return committed, prs
+
+
+@pytest.mark.asyncio
+async def test_named_branch_is_used_instead_of_fix_and_pr_goes_into_default(tmp_path, monkeypatch):
+    committed, prs = _named_branch_setup(tmp_path, monkeypatch)
+
+    result = await coding_flow.run_coding_agent(_tdd(_change()), branch_name="sm/KS-17392-2")
+
+    assert committed["branch"] == "sm/KS-17392-2"
+    assert prs == {"head": "sm/KS-17392-2", "base": "main"}
+    assert len(result["branches"]) == 1
+
+
+@pytest.mark.asyncio
+async def test_named_branch_that_already_exists_is_never_written(tmp_path, monkeypatch):
+    committed, prs = _named_branch_setup(tmp_path, monkeypatch, exists=True)
+    monkeypatch.setattr(
+        coding_flow.patcher, "generate_service_patch", lambda *a, **kw: pytest.fail("no LLM call")
+    )
+
+    result = await coding_flow.run_coding_agent(_tdd(_change()), branch_name="sm/KS-17392-2")
+
+    assert committed == {} and prs == {}
+    assert "already exists" in result["service_notes"][0]["reason"]
+
+
+@pytest.mark.asyncio
+async def test_named_branch_equal_to_the_default_branch_is_refused(tmp_path, monkeypatch):
+    committed, prs = _named_branch_setup(tmp_path, monkeypatch)
+
+    result = await coding_flow.run_coding_agent(_tdd(_change()), branch_name="main")
+
+    assert committed == {} and prs == {}
+    assert "base/default branch" in result["service_notes"][0]["reason"]
+
+
+# --- branch-only mode (the default): push a branch, never open a PR ---------
+
+
+@pytest.mark.asyncio
+async def test_default_mode_pushes_the_named_branch_and_opens_no_pr(tmp_path, monkeypatch):
+    monkeypatch.delenv("OPEN_PULL_REQUEST", raising=False)
+    _one_file_patch_setup(tmp_path, monkeypatch)
+    committed = _stub_commit(monkeypatch)
+    monkeypatch.setattr(coding_flow.github_api, "branch_exists", lambda *a, **kw: False)
+    monkeypatch.setattr(
+        coding_flow.github_api,
+        "create_pull_request",
+        lambda *a, **kw: pytest.fail("no PR in branch-only mode"),
+    )
+
+    result = await coding_flow.run_coding_agent(_tdd(_change()), branch_name="sm/KS-17392-2")
+
+    assert committed["branch"] == "sm/KS-17392-2"
+    assert committed["base_sha"] == "basesha123"  # cut from the default branch's head
+    entry = result["branches"][0]
+    assert entry["pr_url"] is None
+    assert entry["branch"] == "sm/KS-17392-2"
+    assert entry["branch_url"] == "https://github.com/org/orders/tree/sm/KS-17392-2"
+    # what the PR description used to say now travels in the commit message
+    assert committed["message"].startswith("fix: Fix payment failure propagation\n\n")
+    assert "Acceptance criteria" in committed["message"]
+
+
+@pytest.mark.asyncio
+async def test_same_branch_name_is_used_in_every_service(tmp_path, monkeypatch):
+    monkeypatch.delenv("OPEN_PULL_REQUEST", raising=False)
+    _init_repo(tmp_path)
+    specs = {"orders": ServiceSpec("orders", "org/orders"), "ui": ServiceSpec("ui", "org/ui")}
+    monkeypatch.setattr(coding_flow, "resolve_services", lambda t: (specs, []))
+    monkeypatch.setattr(coding_flow, "cloned_repo", _fake_cloned_repo(tmp_path))
+
+    async def fake_patch(service, changes, file_contents, **kw):
+        return [
+            FilePatch(service, "OrderService.java", "modify", f"class X {{ /* {service} */ }}", [])
+        ], []
+
+    monkeypatch.setattr(coding_flow.patcher, "generate_service_patch", fake_patch)
+    monkeypatch.setattr(coding_flow.github_api, "branch_exists", lambda *a, **kw: False)
+    pushed = []
+    monkeypatch.setattr(
+        coding_flow.repo_ops,
+        "commit_patches",
+        lambda repo, root, sha, branch, msg, patches: pushed.append((repo, branch)) or "sha",
+    )
+    tdd = TechnicalDesignDoc(
+        title="t",
+        issue_summary="s",
+        services=[
+            ServicePlan(service="orders", changes=[_change()]),
+            ServicePlan(service="ui", changes=[_change()]),
+        ],
+    )
+
+    result = await coding_flow.run_coding_agent(tdd, branch_name="sm/KS-1")
+
+    assert pushed == [("org/orders", "sm/KS-1"), ("org/ui", "sm/KS-1")]
+    assert [b["service"] for b in result["branches"]] == ["orders", "ui"]
+
+
+@pytest.mark.asyncio
+async def test_local_tests_are_not_run_by_default(tmp_path, monkeypatch):
+    monkeypatch.delenv("OPEN_PULL_REQUEST", raising=False)
+    monkeypatch.delenv("RUN_LOCAL_TESTS", raising=False)
+    _one_file_patch_setup(tmp_path, monkeypatch)
+    committed = _stub_commit(monkeypatch)
+    monkeypatch.setattr(
+        coding_flow.test_runner,
+        "run_tests",
+        lambda *a, **kw: pytest.fail("tests must not run locally"),
+    )
+
+    result = await coding_flow.run_coding_agent(_tdd(_change()))
+
+    assert result["branches"][0]["verification"].ran is False
+    assert "Jenkins runs the tests" in committed["message"]

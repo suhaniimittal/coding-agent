@@ -5,6 +5,7 @@ the only handoff.
 
 from __future__ import annotations
 
+import logging
 import os
 
 from aetherion_sdk import tool
@@ -14,10 +15,55 @@ from src.coding.coding_flow import run_coding_agent
 from src.coding.pdf_extract import extract_text
 from src.coding.tdd_extraction import extract_tdd
 
+logger = logging.getLogger(__name__)
+
+
+def _log_tdd(tdd) -> None:
+    """What the LLM pulled out of the PDF, per service — so a service or file
+    that is missing from the run can be traced to the extraction step."""
+    logger.info("coding_agent: TDD %r has %d service(s)", tdd.title, len(tdd.services))
+    for plan in tdd.services:
+        paths = ", ".join(c.file_path or "<no path>" for c in plan.changes) or "none"
+        logger.info(
+            "coding_agent:   %s: %d change(s) -> %s", plan.service, len(plan.changes), paths
+        )
+
+
+def _log_outcome(result: dict) -> None:
+    """One line per pushed branch and one WARNING per skipped change, with
+    the reason. File paths and reasons only — never file contents."""
+    skipped = result["skipped"]
+    logger.info(
+        "coding_agent: %d branch(es) pushed, %d change(s) skipped",
+        len(result["branches"]),
+        len(skipped),
+    )
+    for b in result["branches"]:
+        logger.info(
+            "coding_agent:   Branch pushed for %s — %s of %s change(s) applied: %s%s",
+            b["service"],
+            b.get("changes_applied", "?"),
+            b.get("changes_total", "?"),
+            b["branch_url"],
+            f" (PR: {b['pr_url']})" if b.get("pr_url") else "",
+        )
+    for item in skipped:
+        logger.warning(
+            "coding_agent:   SKIPPED %s %s — %s", item.service, item.change.file_path, item.reason
+        )
+    for w in result.get("warnings", []):
+        logger.warning("coding_agent:   WARNING %s: %s", w["service"], w["message"])
+    for note in result.get("service_notes", []):
+        logger.warning(
+            "coding_agent:   NOTHING PUSHED for %s — %s", note["service"], note["reason"]
+        )
+
 
 @tool()
 async def run_coding_agent_from_pdf(
-    team_id: str, file_key: str, base_branch_by_service: dict | None = None
+    team_id: str,
+    file_key: str,
+    branch_name: str | None = None,
 ) -> dict:
     """Retrieves the uploaded TDD PDF from storage, extracts its text,
     recovers the structured TechnicalDesignDoc from that text (one LLM
@@ -41,22 +87,29 @@ async def run_coding_agent_from_pdf(
 
     pdf_text = extract_text(pdf_bytes)
     tdd = await extract_tdd(pdf_text)
-    result = await run_coding_agent(tdd, base_branch_by_service=base_branch_by_service)
+    _log_tdd(tdd)
+    result = await run_coding_agent(tdd, branch_name=branch_name, doc_text=pdf_text)
+    _log_outcome(result)
 
     return {
         "tdd_title": tdd.title,
-        "pull_requests": [
+        "branches": [
             {
-                "service": pr["service"],
-                "pr_url": pr["pr_url"],
-                "tests_ran": pr["verification"].ran,
-                "tests_passed": pr["verification"].passed,
-                "verification_detail": pr["verification"].detail,
+                "service": b["service"],
+                "repo": b["repo"],
+                "branch": b["branch"],
+                "branch_url": b["branch_url"],
+                "pr_url": b["pr_url"],
+                "tests_ran": b["verification"].ran,
+                "tests_passed": b["verification"].passed,
+                "verification_detail": b["verification"].detail,
             }
-            for pr in result["pull_requests"]
+            for b in result["branches"]
         ],
         "skipped": [
             {"service": s.service, "file_path": s.change.file_path, "reason": s.reason}
             for s in result["skipped"]
         ],
+        "service_notes": result.get("service_notes", []),
+        "warnings": result.get("warnings", []),
     }

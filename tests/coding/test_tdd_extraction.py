@@ -119,3 +119,15 @@ async def test_extract_tdd_uses_gateway_when_configured(monkeypatch):
     assert tdd.title == "Fix total calculation"
     assert len(calls) == 1
     assert "extracted text" in calls[0][1]
+
+
+def test_prompt_embeds_the_schema_and_wraps_the_document_text():
+    from src.coding import tdd_extraction
+
+    system_prompt, user_prompt = tdd_extraction._build_prompt("HELLO PDF TEXT")
+
+    for field in ("function_or_symbol", "change_type", "file_path", "services"):
+        assert field in system_prompt  # the schema made it into the prompt
+    assert "{schema}" not in system_prompt
+    assert "<TDD_DOCUMENT_TEXT>\nHELLO PDF TEXT\n</TDD_DOCUMENT_TEXT>" in user_prompt
+    assert "HELLO PDF TEXT" not in system_prompt

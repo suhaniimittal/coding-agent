@@ -163,3 +163,36 @@ def test_nested_path_inside_the_repo_is_still_verified(tmp_path):
     )
 
     assert len(verified) == 1 and skipped == []
+
+
+def test_create_on_an_existing_file_becomes_modify(tmp_path):
+    (tmp_path / "src").mkdir()
+    (tmp_path / "src" / "Existing.kt").write_text("class Existing { /* 200 lines */ }")
+    spec = ServiceSpec(name="orders", repo="org/orders")
+    change = _change(file_path="src/Existing.kt", change_type="create")
+
+    verified, skipped = verify_changes_for_service("orders", spec, tmp_path, [change])
+
+    assert skipped == []
+    assert verified[0].change.change_type == "modify"
+    assert change.change_type == "create"  # the TDD's own object is not mutated
+
+
+def test_create_on_a_new_file_stays_create(tmp_path):
+    spec = ServiceSpec(name="orders", repo="org/orders")
+    change = _change(file_path="src/New.kt", change_type="create")
+
+    verified, _ = verify_changes_for_service("orders", spec, tmp_path, [change])
+
+    assert verified[0].change.change_type == "create"
+
+
+def test_create_on_a_directory_is_skipped(tmp_path):
+    (tmp_path / "src").mkdir()
+    spec = ServiceSpec(name="orders", repo="org/orders")
+
+    verified, skipped = verify_changes_for_service(
+        "orders", spec, tmp_path, [_change(file_path="src", change_type="create")]
+    )
+
+    assert verified == [] and "is a directory" in skipped[0].reason

@@ -13,11 +13,14 @@ call:
 
 from __future__ import annotations
 
+import logging
 from pathlib import Path
 
 from .graph_lookup import AmbiguousServiceError, ServiceSpec, list_service_names, resolve_service
 from .models import SkippedChange, VerifiedChange
 from .tdd_models import TechnicalDesignDoc
+
+logger = logging.getLogger(__name__)
 
 
 def _is_inside_repo(repo_root: Path, file_path: str) -> bool:
@@ -29,6 +32,41 @@ def _is_inside_repo(repo_root: Path, file_path: str) -> bool:
     return target == root or root in target.parents
 
 
+def triage_changes(service: str, changes) -> tuple[list, list[SkippedChange], int]:
+    """Decides, BEFORE any repo download, which TDD changes are actionable.
+    Returns (actionable, skipped, reference_count):
+
+    - change_type "reference": the file is only read by the new code. Never
+      edited, never counted toward a PR, not reported as a problem — just
+      counted and logged.
+    - Code check "UNVERIFIED": the planner could not find this file/symbol in
+      the real code, so writing it would be a guess. Skipped and reported.
+    """
+    actionable, skipped, references = [], [], 0
+    for change in changes:
+        if change.change_type == "reference":
+            references += 1
+            logger.info(
+                "validation: %s %s is reference-only (read, not changed) — not edited",
+                service,
+                change.file_path,
+            )
+            continue
+        if change.code_check == "UNVERIFIED":
+            note = f" ({change.code_check_note})" if change.code_check_note else ""
+            skipped.append(
+                SkippedChange(
+                    service,
+                    change,
+                    f"Code check: UNVERIFIED{note} — the planner could not confirm this "
+                    "file/symbol in the real code, so no code was written for it",
+                )
+            )
+            continue
+        actionable.append(change)
+    return actionable, skipped, references
+
+
 def verify_changes_for_service(
     service_plan_service: str, spec: ServiceSpec, repo_root: Path, changes
 ) -> tuple[list[VerifiedChange], list[SkippedChange]]:
@@ -36,8 +74,11 @@ def verify_changes_for_service(
     `skipped` (flagged for a human, never applied), checked against
     `repo_root` — an already-cloned working tree for this exact service.
 
-    A "create" change has nothing to look up yet (the file doesn't exist),
-    so it's verified as long as it names a file_path. A "modify"/"delete"
+    A "create" change is checked too: if its file_path ALREADY exists in the
+    clone it is turned into a "modify", so the patcher is given the file's
+    real content. Older TDDs used "create" to mean "new symbol", which put it
+    on files with hundreds of lines; writing such a file from scratch would
+    silently replace all of them with only the new code. A "modify"/"delete"
     change must resolve to a real file ON DISK in the clone, not just the
     PDF's own claim — this catches a file_path that's genuinely stale
     (moved, renamed, deleted since the TDD was generated).
@@ -75,6 +116,24 @@ def verify_changes_for_service(
                     )
                 )
                 continue
+            target = repo_root / change.file_path
+            if target.is_dir():
+                skipped.append(
+                    SkippedChange(
+                        service_plan_service,
+                        change,
+                        f"change_type is 'create' but {change.file_path!r} is a directory",
+                    )
+                )
+                continue
+            if target.exists():
+                logger.warning(
+                    "validation: %s %s is marked 'create' but already exists — "
+                    "treating it as 'modify' so its current content is kept",
+                    service_plan_service,
+                    change.file_path,
+                )
+                change = change.model_copy(update={"change_type": "modify"})
             verified.append(VerifiedChange(service_plan_service, spec.repo, spec.branch, change))
             continue
 

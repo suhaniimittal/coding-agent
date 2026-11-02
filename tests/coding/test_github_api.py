@@ -57,13 +57,13 @@ def test_create_branch_commit_runs_blob_tree_commit_ref_in_order(monkeypatch):
 
 
 def test_create_branch_commit_error_includes_github_message(monkeypatch):
-    monkeypatch.setattr(
-        github_api.httpx, "get", lambda url, **kw: _Resp({"tree": {"sha": "t"}})
-    )
+    monkeypatch.setattr(github_api.httpx, "get", lambda url, **kw: _Resp({"tree": {"sha": "t"}}))
     monkeypatch.setattr(
         github_api.httpx,
         "post",
-        lambda *a, **kw: _Resp({"message": "Resource not accessible by personal access token"}, 403),
+        lambda *a, **kw: _Resp(
+            {"message": "Resource not accessible by personal access token"}, 403
+        ),
     )
 
     with pytest.raises(github_api.GitHubApiError, match="not accessible"):
@@ -172,3 +172,13 @@ def test_requests_go_to_the_enterprise_host(monkeypatch):
 
     assert github_api.get_default_branch("keystone/reports-api", token="t") == "develop"
     assert seen["url"] == "https://github.asurint.com/api/v3/repos/keystone/reports-api"
+
+
+def test_branch_web_url_for_github_com_and_enterprise(monkeypatch):
+    monkeypatch.delenv("GITHUB_API_URL", raising=False)
+    assert github_api.branch_web_url("o/r", "sm/KS-1") == "https://github.com/o/r/tree/sm/KS-1"
+    monkeypatch.setenv("GITHUB_API_URL", "https://github.asurint.com/api/v3")
+    assert (
+        github_api.branch_web_url("keystone/ui", "sm/KS-1")
+        == "https://github.asurint.com/keystone/ui/tree/sm/KS-1"
+    )

@@ -14,9 +14,18 @@ AGENTS_GATEWAY_KEY + AI_GATEWAY_URL are set, else OpenAI directly.
 from __future__ import annotations
 
 import json
+import logging
 import os
 
 from .models import FilePatch, VerifiedChange
+
+logger = logging.getLogger(__name__)
+
+# One reply must hold the FULL new content of every file in the call, JSON-escaped,
+# and the model's output is capped (16000 tokens ~ 40k characters of code JSON).
+# Files are therefore sent in batches: a batch stops growing once its source
+# files add up to this many characters, so the reply cannot hit the cap.
+_BATCH_SOURCE_CHARS = 18_000
 
 _GATEWAY_PROVIDER, _GATEWAY_MODEL = "anthropic", "claude-sonnet-4-6"
 _OPENAI_MODEL = "gpt-4o"
@@ -91,7 +100,12 @@ async def _call_via_openai(system_prompt: str, user_prompt: str) -> str:
         ],
         max_tokens=16000,
     )
-    return resp.choices[0].message.content
+    choice = resp.choices[0]
+    if choice.finish_reason == "length":
+        raise PatcherError(
+            "LLM reply was cut off at the output-token limit (too many or too large files)"
+        )
+    return choice.message.content
 
 
 def _strip_fences(text: str) -> str:
@@ -107,7 +121,12 @@ def _strip_fences(text: str) -> str:
     return text.strip()
 
 
-def _build_prompt(service: str, file_groups: dict[str, list[VerifiedChange]], file_contents: dict[str, str | None]) -> tuple[str, str]:
+def _build_prompt(
+    service: str,
+    file_groups: dict[str, list[VerifiedChange]],
+    file_contents: dict[str, str | None],
+    context_files: dict[str, list[dict]] | None = None,
+) -> tuple[str, str]:
     system_prompt = (
         "You are making precise, minimal code changes to a set of files in "
         "one real codebase's service, based on a technical design document. "
@@ -119,7 +138,17 @@ def _build_prompt(service: str, file_groups: dict[str, list[VerifiedChange]], fi
         "COMPLETE content of the file, not a diff or excerpt, ready to "
         "write directly to disk as-is). Return exactly one array entry per "
         "file listed below — never omit a listed file, never add one that "
-        "wasn't listed."
+        "wasn't listed.\n\n"
+        'Some files carry "reference_files": real files from the same repository, '
+        "given as READ-ONLY context. Never return them as entries. When you write or "
+        "change a TEST file: copy the imports, setup/render helpers, providers and "
+        "mocking style from the example test(s) shown; use only modules, exports, "
+        "props, test ids and APIs that appear in the reference files or in the file's "
+        "own current content; never invent a helper, context, provider, prop or import "
+        "path. Test the changed behaviour directly with the smallest input that reaches "
+        "it: for a validation schema, call validateAt on the one field; for a component "
+        "whose onChange or other callback is a jest.fn() mock, assert what the mock was "
+        "called with rather than the input's displayed value."
     )
 
     files_section = []
@@ -141,10 +170,15 @@ def _build_prompt(service: str, file_groups: dict[str, list[VerifiedChange]], fi
             {
                 "file_path": file_path,
                 "change_type": change_type,
-                "current_content": file_contents.get(file_path) if change_type == "modify" else None,
+                "current_content": file_contents.get(file_path)
+                if change_type == "modify"
+                else None,
                 "requested_changes": requested_changes,
             }
         )
+        refs = (context_files or {}).get(file_path)
+        if refs:
+            files_section[-1]["reference_files"] = refs
 
     user_prompt = f"Service: {service}\n\nFiles to change:\n" + json.dumps(files_section, indent=2)
     return system_prompt, user_prompt
@@ -172,36 +206,41 @@ def _parse_response(raw: str) -> dict[str, dict]:
     return by_path
 
 
-async def generate_service_patch(
+def _batches(
+    file_groups: dict[str, list[VerifiedChange]], file_contents: dict[str, str | None]
+) -> list[dict[str, list[VerifiedChange]]]:
+    """Splits a service's files into batches whose current source totals at
+    most _BATCH_SOURCE_CHARS (a lone larger file still gets its own batch)."""
+    batches: list[dict[str, list[VerifiedChange]]] = []
+    current: dict[str, list[VerifiedChange]] = {}
+    size = 0
+    for file_path, group in file_groups.items():
+        file_size = len(file_contents.get(file_path) or "") + 500
+        if current and size + file_size > _BATCH_SOURCE_CHARS:
+            batches.append(current)
+            current, size = {}, 0
+        current[file_path] = group
+        size += file_size
+    if current:
+        batches.append(current)
+    return batches
+
+
+async def _patch_batch(
     service: str,
-    changes: list[VerifiedChange],
+    file_groups: dict[str, list[VerifiedChange]],
     file_contents: dict[str, str | None],
+    context_files: dict[str, list[dict]] | None = None,
 ) -> tuple[list[FilePatch], list[str]]:
-    """One LLM call producing the full corrected content for every
-    modify/create file in this service's changeset at once. `changes` must
-    only contain modify/create entries — a caller applies "delete" directly,
-    no LLM call needed for it.
-
-    Returns (patches, missing_file_paths): `missing_file_paths` lists any
-    requested file whose entry was absent or empty in an otherwise-valid
-    response — the plan's "structured, not free-form" contract treats a
-    missing file as failed/skipped for that file, not silently dropped and
-    not grounds to fail the whole service.
-
-    Raises PatcherError only when the call itself fails or the response
-    can't be parsed as the expected JSON shape at all.
-    """
-    if not changes:
-        return [], []
-
-    file_groups = group_verified_changes(changes)
-    system_prompt, user_prompt = _build_prompt(service, file_groups, file_contents)
+    system_prompt, user_prompt = _build_prompt(service, file_groups, file_contents, context_files)
 
     try:
         if _use_gateway():
             raw = await _call_via_gateway(system_prompt, user_prompt)
         else:
             raw = await _call_via_openai(system_prompt, user_prompt)
+    except PatcherError:
+        raise
     except Exception as e:  # noqa: BLE001 - a provider error must surface as a clear per-service failure
         raise PatcherError(f"{service}: LLM call failed: {e}") from e
 
@@ -218,5 +257,55 @@ async def generate_service_patch(
         change_type = effective_change_type(group)
         changes_applied = [v.change.change_description for v in group]
         patches.append(FilePatch(service, file_path, change_type, content, changes_applied))
+    return patches, missing
 
+
+async def generate_service_patch(
+    service: str,
+    changes: list[VerifiedChange],
+    file_contents: dict[str, str | None],
+    context_files: dict[str, list[dict]] | None = None,
+) -> tuple[list[FilePatch], list[str]]:
+    """LLM calls producing the full corrected content for every modify/create
+    file in this service's changeset. `changes` must only contain
+    modify/create entries — a caller applies "delete" directly, no LLM call
+    needed for it.
+
+    Normally ONE call covers the whole service. Files whose combined source
+    exceeds _BATCH_SOURCE_CHARS are split across several calls, because one
+    reply holding every file in full can hit the model's output limit and
+    come back cut off mid-string.
+
+    Returns (patches, missing_file_paths): `missing_file_paths` lists any
+    requested file whose entry was absent or empty in an otherwise-valid
+    response, or whose batch failed while another batch succeeded — the
+    plan's "structured, not free-form" contract treats that as skipped for
+    that file, not silently dropped and not grounds to fail the whole service.
+
+    Raises PatcherError when every call failed (a single-batch service fails
+    exactly as before).
+    """
+    if not changes:
+        return [], []
+
+    file_groups = group_verified_changes(changes)
+    patches: list[FilePatch] = []
+    missing: list[str] = []
+    errors: list[PatcherError] = []
+
+    for batch in _batches(file_groups, file_contents):
+        try:
+            batch_patches, batch_missing = await _patch_batch(
+                service, batch, file_contents, context_files
+            )
+        except PatcherError as e:
+            logger.warning("patcher: %s: batch of %d file(s) failed: %s", service, len(batch), e)
+            errors.append(e)
+            missing.extend(batch)
+            continue
+        patches.extend(batch_patches)
+        missing.extend(batch_missing)
+
+    if errors and not patches:
+        raise errors[-1]
     return patches, missing

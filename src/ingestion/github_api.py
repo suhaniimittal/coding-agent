@@ -45,6 +45,17 @@ def _target(repo: str) -> tuple[str, str]:
     return (os.environ.get("GITHUB_API_URL") or _API_BASE).rstrip("/"), repo
 
 
+def branch_web_url(repo: str, branch: str) -> str:
+    """The branch's page on the GitHub website (not the API) — where the
+    commit, its files and Jenkins' status checks are shown."""
+    base, slug = _target(repo)
+    if base == _API_BASE:
+        web = "https://github.com"
+    else:
+        web = base[: -len("/api/v3")] if base.endswith("/api/v3") else base
+    return f"{web}/{slug}/tree/{branch}"
+
+
 def _repo_api(repo: str, suffix: str = "") -> str:
     base, slug = _target(repo)
     return f"{base}/repos/{slug}{suffix}"
