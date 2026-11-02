@@ -1,10 +1,10 @@
 """Agent — coding_agent.
 
-Thin Aetherion binding: takes an uploaded TDD PDF and turns it into real
-Pull Requests. No pipeline logic lives here — per the SDK's "no direct I/O
-in the agent" rule, the tool does all the actual PDF/LLM/git/GitHub work;
-this just orchestrates the one call via `toolExecutor.execute` and shapes
-the result for the platform UI.
+Thin Aetherion binding: takes an uploaded TDD PDF and turns it into pull
+requests. No pipeline logic lives here — per the SDK's "no direct I/O in the
+agent" rule, the tool does all the actual PDF/LLM/GitHub work; this just
+orchestrates the one call via `toolExecutor.execute` and shapes the result
+for the platform UI: one link per pull request, or why there is none.
 
 The one piece of logic here is the error boundary. A workflow that raises
 shows up in the console as a failed run with *no output to summarise*, which
@@ -16,9 +16,18 @@ itself. Nothing is swallowed: the full traceback still reaches the worker log.
 from __future__ import annotations
 
 import logging
+from datetime import timedelta
 from typing import Any
 
 from aetherion_sdk import agent, toolExecutor
+from temporalio.common import RetryPolicy
+
+# A run downloads each service and makes a few long model calls per service;
+# the platform's default activity timeout (~30 s) would kill it mid-way.
+_RUN_TIMEOUT = timedelta(minutes=15)
+# Never re-run on its own: a second run would open a second branch and pull
+# request beside the first one's. A failure is reported instead.
+_RUN_RETRY = RetryPolicy(maximum_attempts=1)
 
 logger = logging.getLogger(__name__)
 
@@ -44,59 +53,58 @@ async def coding_agent(payload: dict[str, Any]) -> dict[str, Any]:
     uploaded = payload.get("uploaded_files")
     file_key = uploaded[0] if isinstance(uploaded, list) and uploaded else uploaded
     # One branch name for every repo the TDD changes (e.g. "sm/KS-17392-2");
-    # empty means the agent generates fix/<issue>-<id>.
+    # empty means the agent generates fix/<ticket>-<id>.
     branch_name = str(payload.get("branch_name") or "").strip() or None
 
     try:
         result = await toolExecutor.execute(
-            "run_coding_agent_from_pdf", team_id, file_key, branch_name
+            "run_coding_agent_from_pdf",
+            team_id,
+            file_key,
+            branch_name,
+            start_to_close_timeout=_RUN_TIMEOUT,
+            retry_policy=_RUN_RETRY,
         )
-
-        structured_results = [
-            (
-                {
-                    "title": f"PR: {b['service']}",
-                    "link": f"[Open PR for {b['service']}]({b['pr_url']})",
-                    "label": f"Open PR for {b['service']}",
-                    "extension": "url",
-                }
-                if b.get("pr_url")
-                else {
-                    "title": f"Branch: {b['service']}",
-                    "link": f"[{b['branch']} in {b['repo']}]({b['branch_url']})",
-                    "label": f"Open branch for {b['service']}",
-                    "extension": "url",
-                }
-            )
-            for b in result["branches"]
-        ]
-
-        if structured_results:
-            # Only the branch (or PR) links — test results, skipped changes and
-            # the TDD title stay in the tool's own activity output.
-            return {"status": "success", "results": structured_results}
-
-        # Nothing pushed at all: say why, so an empty result isn't a mystery.
-        reasons = (
-            "; ".join(
-                [f"{n['service']}: {n['reason']}" for n in result.get("service_notes", [])]
-                + [f"{s['service']}: {s['reason']}" for s in result["skipped"]]
-            )
-            or "no changes to apply"
-        )
-        return {
-            "status": "nothing_pushed",
-            "message": f"No branch was pushed — {reasons}"[:500],
-            "results": [],
-        }
     except Exception as error:  # noqa: BLE001 - surface the failure, never hide it
         logger.error("coding_agent run failed: %s", error, exc_info=True)
+        root = _root(error)
         return {
             "status": "error",
-            "error": type(error).__name__,
-            "message": (
-                f"The run failed before it could push any branch: {type(error).__name__}: {error}"
-            )[:500],
+            "error": type(root).__name__,
+            "message": f"The run failed before any pull request was opened: {root}"[:1000],
             "file_key": file_key,
             "details": {"workflow_id": workflow_id},
         }
+
+    services = result["services"]
+    links = [
+        {
+            "title": f"{'Draft PR' if s.get('draft') else 'PR'}: {s['service']}",
+            "link": f"[Open the pull request for {s['service']}]({s['pr_url']})",
+            "label": f"Open PR for {s['service']}",
+            "extension": "url",
+        }
+        for s in services
+        if s.get("pr_url")
+    ]
+    others = [
+        f"{s['service']}: {s['status']} — {s['reason']}" for s in services if not s.get("pr_url")
+    ]
+    if links:
+        out: dict[str, Any] = {"status": "success", "results": links}
+        if others:
+            out["message"] = "; ".join(others)[:1000]
+        return out
+    return {
+        "status": "nothing_pushed",
+        "message": ("No pull request was opened — " + "; ".join(others or ["no services"]))[:1000],
+        "results": [],
+    }
+
+
+def _root(error: BaseException) -> BaseException:
+    """The error at the bottom of Temporal's wrapping (ActivityError ->
+    ApplicationError -> ...), whose message says what actually went wrong."""
+    while getattr(error, "cause", None) is not None:
+        error = error.cause
+    return error

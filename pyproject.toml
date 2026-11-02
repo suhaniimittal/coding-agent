@@ -13,10 +13,14 @@ requires-python = ">=3.12.10,<3.13"
 dependencies = [
     "aetherion-sdk @ https://sdk.sbox.aetherion.io/Darwin/aetherion_sdk-0.0.100-cp312-cp312-macosx_26_0_arm64.whl",
     "httpx",
-    "neo4j",
     "openai",
     "pydantic>=2.13,<3",
     "pypdf",
+    # Syntax check of the model's changed files (src/coding/code_checks.py),
+    # in place of a build. Pinned to 0.13.0: later releases publish no Linux
+    # wheel, and the platform runs on Linux.
+    "tree-sitter",
+    "tree-sitter-language-pack==0.13.0",
 ]
 
 [dependency-groups]

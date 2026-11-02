@@ -1,7 +1,7 @@
 {
     "name": "coding-agent",
     "version": "1.0.0",
-    "description": "Takes a Technical Design Document (PDF) and pushes one new branch with the implementing commit to every affected service's repo — no Pull Request, so CI (Jenkins) can be checked first.",
+    "description": "Takes a Technical Design Document (PDF) from planning_agent and, for every service it names, downloads the code at the TDD's commit, makes the change and opens a pull request (a draft unless every check passed) on a new branch. Jenkins builds the branch.",
     "config": {
         "triggers": [
             {
@@ -9,7 +9,7 @@
                 "type": "file",
                 "required": true,
                 "accepts": ".pdf",
-                "description": "The Technical Design Document to implement, as a PDF.",
+                "description": "The Technical Design Document to implement, as the PDF planning_agent made.",
                 "friendly_name": "TDD (PDF)"
             },
             {

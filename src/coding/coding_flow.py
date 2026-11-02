@@ -1,342 +1,264 @@
-"""Orchestrates the whole coding pipeline: TDD -> verified changes -> one
-real patch call per service -> a real branch -> real test verification -> a
-real Pull Request. Never touches the default branch, never auto-merges,
-never claims a fix works without having actually tried it, and never
-retries an LLM call to "repair" a test failure — a failure is reported
-honestly in the PR instead.
+"""The coding run (2026-11-02): a TDD's task -> per service, its code on
+disk -> the coding model's change -> one commit on a new branch -> a pull
+request -> the folder deleted.
 
-Considered and rejected: a second "critic" LLM pass reviewing each proposed
-change before applying it. Rejected because it doesn't catch the failure
-mode that matters most — a proposal that *sounds* correct from reading the
-code but is wrong about the real world. A second LLM reading the same code
-has the identical blind spot and would approve the same broken plan. That
-class of error can only be caught by actually trying it (a real test run),
-not by asking for another opinion. So validation here is either free (a
-real filesystem check against the clone) or real (actual test execution) —
-never a second guess.
+Per service in the TDD's "Services to change" table, one after another:
 
-Download-before-validate ordering (different from a Neo4j-backed structural
-check): this project has zero shared infrastructure with the planning
-project, so "does this file exist" is checked against a real clone made
-right here, which means the clone has to happen before validation can run
-for that service, not after.
+1. download the repository at the TDD's commit into this run's folder
+   (workspace.py; no git, no Neo4j);
+2. gather the code around the TDD's files (context_pack.py, no model call);
+3. the coding model's rounds (coder.py: look, change, fix if the checks
+   found problems);
+4. the changed files (by fingerprint) as ONE commit on a NEW branch, made
+   through the GitHub API; an existing branch is never written to;
+5. a pull request into the TDD's branch, as a draft unless CODING_DRAFT_PR
+   is false and nothing is open. The description says what changed and
+   why, how each requirement is met, where the TDD was not followed, the
+   checks' result and the TDD's test plan;
+6. the folder: deleted CODING_KEEP_MINUTES after the run when any pull
+   request was opened, at once otherwise.
+
+Nothing is merged, and the default branch is never touched. A service that
+can't be done is reported with its reason; the others go on. Tests are left
+to Jenkins, which builds the pushed branch: the agent can't build.
 """
 
 from __future__ import annotations
 
 import os
-import uuid
+import re
 from pathlib import Path
 
 from src.ingestion import github_api
-from src.ingestion.repo_fetcher import RepoFetchError, cloned_repo
 
-from . import patcher, repo_ops, test_runner
-from .models import FilePatch, SkippedChange, VerificationResult, VerifiedChange
-from .tdd_models import TechnicalDesignDoc
-from .test_context import build_test_context
-from .test_pairing import enforce_test_pairs
-from .validation import resolve_services, triage_changes, verify_changes_for_service
+from . import coder, context_pack, workspace
+from .repo_tools import RepoTools
+from .tdd_reader import ServiceTarget, Task
 
 
-def _read_current_content(repo_root: Path, file_path: str) -> str | None:
-    target = repo_root / file_path
-    return target.read_text() if target.exists() else None
+def _draft_by_default() -> bool:
+    return os.environ.get("CODING_DRAFT_PR", "true").strip().lower() not in {"0", "false", "no"}
 
 
-async def _build_patches(
-    repo_root: Path,
-    service: str,
-    service_changes: list[VerifiedChange],
-    doc_text: str | None = None,
-) -> tuple[list[FilePatch], list[SkippedChange]]:
-    """One LLM call for this whole service (patcher.py's contract), plus
-    direct (no-LLM) handling of any "delete" entries. A "modify" naming a
-    path that doesn't actually exist in the clone is skipped before the
-    call — there's nothing to send as its current content."""
-    patches: list[FilePatch] = []
-    skipped: list[SkippedChange] = []
-
-    file_groups = patcher.group_verified_changes(service_changes)
-    llm_groups: dict[str, list[VerifiedChange]] = {}
-    file_contents: dict[str, str | None] = {}
-
-    for file_path, group in file_groups.items():
-        change_type = patcher.effective_change_type(group)
-        if change_type == "delete":
-            changes_applied = [v.change.change_description for v in group]
-            patches.append(FilePatch(service, file_path, "delete", None, changes_applied))
-            continue
-
-        if change_type == "modify":
-            current_content = _read_current_content(repo_root, file_path)
-            if current_content is None:
-                for v in group:
-                    skipped.append(
-                        SkippedChange(
-                            service, v.change, f"{file_path!r} not found in the cloned repo"
-                        )
-                    )
-                continue
-            file_contents[file_path] = current_content
-
-        llm_groups[file_path] = group
-
-    llm_changes = [v for group in llm_groups.values() for v in group]
-    if llm_changes:
-        try:
-            # Fix A: test files get the production file they cover, an example
-            # test and CLAUDE.md as read-only context (only passed when there
-            # is a test file to write).
-            context = build_test_context(repo_root, llm_groups, service_changes, doc_text)
-            extra = {"context_files": context} if context else {}
-            llm_patches, missing = await patcher.generate_service_patch(
-                service, llm_changes, file_contents, **extra
-            )
-        except patcher.PatcherError as e:
-            for v in llm_changes:
-                skipped.append(SkippedChange(service, v.change, str(e)))
+async def run(task: Task, branch_name: str | None = None) -> dict:
+    """{"services": [one result per service], "run_id": ...}. A result has
+    "service", "repo", "status" ("pr_opened" | "gave_up" | "no_change" |
+    "failed" | "skipped"), "reason", and when a pull request was opened its
+    "pr_url", "branch", "branch_url", "draft", "files" and "model_calls"."""
+    workspace.sweep()
+    run_id = workspace.new_run_id()
+    results = []
+    try:
+        for target in task.services:
+            results.append(await _one_service(task, target, run_id, branch_name))
+    finally:
+        if any(r["status"] == "pr_opened" for r in results):
+            workspace.delete_later(run_id)
         else:
-            patches.extend(llm_patches)
-            for file_path in missing:
-                for v in llm_groups[file_path]:
-                    skipped.append(
-                        SkippedChange(
-                            service, v.change, "LLM response missing content for this file"
-                        )
-                    )
+            workspace.delete(run_id)
+    return {"run_id": run_id, "services": results}
 
-    return patches, skipped
+
+async def _one_service(
+    task: Task, target: ServiceTarget, run_id: str, branch_name: str | None
+) -> dict:
+    out = {"service": target.service, "repo": target.repo, "status": "failed", "reason": ""}
+    branch = (branch_name or "").strip() or _branch_name(task, run_id)
+    try:
+        if branch == target.branch:
+            return {**out, "status": "skipped", "reason": f"{branch!r} is the base branch"}
+        if github_api.branch_exists(target.repo, branch):
+            return {
+                **out,
+                "status": "skipped",
+                "reason": f"branch {branch!r} already exists in {target.repo}; the agent only "
+                "creates new branches",
+            }
+        checkout = workspace.download(
+            run_id, target.service, target.repo, target.branch, target.commit
+        )
+    except (workspace.WorkspaceError, github_api.GitHubApiError) as e:
+        return {**out, "reason": str(e)}
+
+    tools = RepoTools(checkout.root)
+    index = context_pack.Index(tools, target.folder)
+    pack = context_pack.build(tools, index, task, target.service)
+    print(
+        f"  [CODER] {target.service}: context: {len(pack.shown)} file(s) shown, "
+        f"{len(pack.listed)} listed, {len(pack.names)} name(s), "
+        f"{len(pack.missing)} TDD path(s) not found"
+    )
+    outcome = await coder.run(task, target.service, tools, index, pack)
+    out["model_calls"] = outcome.calls
+    if outcome.status != "changed":
+        return {**out, "status": outcome.status, "reason": outcome.reason}
+    # An edit that never applied means the change is only part done (BTS-40
+    # opened a PR holding just the new test): report it, open nothing.
+    failed_edits = [p.split("\n", 1)[0] for p in outcome.problems if p.startswith("edit ")]
+    if failed_edits:
+        return {
+            **out,
+            "reason": "the change could not be applied in full, so no pull request was opened: "
+            + "; ".join(failed_edits),
+        }
+
+    changes = checkout.changes()
+    if not changes:
+        return {**out, "status": "no_change", "reason": "the change left every file as it was"}
+    change = outcome.change
+    draft_reasons = _draft_reasons(task, outcome)
+    title = _title(task, change)
+    body = _pr_body(task, target, outcome, changes, pack, draft_reasons)
+    try:
+        github_api.create_branch_commit(
+            target.repo,
+            checkout.sha,
+            branch,
+            f"{title}\n\n{change.get('summary') or ''}".strip(),
+            _commit_files(checkout.root, changes),
+        )
+        draft = _draft_by_default() or bool(draft_reasons)
+        pr_url, draft = _open_pr(target, branch, title, body, draft)
+    except github_api.GitHubApiError as e:
+        return {**out, "reason": str(e)}
+    print(f"  [CODER] {target.service}: pull request opened{' (draft)' if draft else ''}")
+    return {
+        **out,
+        "status": "pr_opened",
+        "pr_url": pr_url,
+        "branch": branch,
+        "branch_url": github_api.branch_web_url(target.repo, branch),
+        "draft": draft,
+        "files": [f"{c.path} ({c.status})" for c in changes],
+        "reason": "; ".join(draft_reasons),
+    }
+
+
+def _open_pr(target: ServiceTarget, branch: str, title: str, body: str, draft: bool):
+    """(url, draft). A repository whose plan has no draft pull requests
+    refuses one: it is then opened as a normal one, marked in the title."""
+    try:
+        return github_api.create_pull_request(
+            target.repo, branch, target.branch, title, body, draft=draft
+        ), draft
+    except github_api.GitHubApiError as e:
+        if not draft or "draft" not in str(e).lower():
+            raise
+    url = github_api.create_pull_request(
+        target.repo, branch, target.branch, f"[Draft] {title}", body, draft=False
+    )
+    return url, True
+
+
+def _draft_reasons(task: Task, outcome: coder.Outcome) -> list[str]:
+    reasons = [f"check not passed: {p}" for p in outcome.problems]
+    reasons += [f"over the size limit: {p}" for p in outcome.over_limits]
+    if str(outcome.change.get("confidence") or "").lower() != "high":
+        reasons.append(f"the model's confidence is {outcome.change.get('confidence') or 'unknown'}")
+    if task.status == "draft":
+        reasons.append("the TDD is a draft")
+    if task.high_level:
+        reasons.append("the TDD was written from file paths only")
+    return reasons
+
+
+def _branch_name(task: Task, run_id: str) -> str:
+    base = task.ticket or task.title or "change"
+    slug = re.sub(r"[^a-z0-9]+", "-", base.lower()).strip("-")[:40] or "change"
+    return f"fix/{slug}-{run_id.rsplit('-', 1)[-1]}"
+
+
+def _title(task: Task, change: dict) -> str:
+    title = str(change.get("pr_title") or task.title or "Change from TDD").strip()
+    if task.ticket and task.ticket.lower() not in title.lower():
+        title = f"{task.ticket}: {title}"
+    return title[:200]
+
+
+def _commit_files(root: Path, changes: list[workspace.Change]) -> list[dict]:
+    files = []
+    for c in changes:
+        if c.status == "deleted":
+            files.append({"path": c.path, "content": None, "mode": "100644"})
+            continue
+        target = root / c.path
+        with open(target, encoding="utf-8", newline="") as f:
+            content = f.read()
+        executable = target.stat().st_mode & 0o111
+        files.append(
+            {"path": c.path, "content": content, "mode": "100755" if executable else "100644"}
+        )
+    return files
 
 
 def _pr_body(
-    tdd: TechnicalDesignDoc,
-    service_changes: list[VerifiedChange],
-    applied: list[FilePatch],
-    skipped: list[SkippedChange],
-    verification: VerificationResult,
-    warnings: list[str] | None = None,
+    task: Task,
+    target: ServiceTarget,
+    outcome: coder.Outcome,
+    changes: list[workspace.Change],
+    pack: context_pack.Pack,
+    draft_reasons: list[str],
 ) -> str:
-    lines = [f"## {tdd.title}", "", tdd.issue_summary]
-    if warnings:
-        lines += ["", "### ⚠️ Test changes NOT applied — this PR will likely fail CI"]
-        lines += [f"- {w}" for w in warnings]
-    lines += ["", "### Acceptance criteria"]
-    criteria = [c for v in service_changes for c in v.change.acceptance_criteria]
-    lines += [f"- [ ] {c}" for c in criteria] or ["- (none specified)"]
+    change = outcome.change
+    lines = []
+    if draft_reasons:
+        lines += ["> **Draft: please review closely.**"]
+        lines += [f"> - {r}" for r in draft_reasons]
+        lines.append("")
+    lines += [str(change.get("summary") or task.fix or "").strip(), ""]
+    lines.append(f"Ticket: {task.ticket or '-'} · TDD: {task.title}")
+    lines.append(f"Based on `{target.repo}` at `{target.branch}` commit `{target.commit[:12]}`.")
 
-    lines += ["", "### Files changed"]
-    lines += [
-        f"- `{p.file_path}` ({p.change_type}): {', '.join(p.changes_applied)}" for p in applied
-    ] or ["- (none)"]
+    lines += ["", "### Cause", str(change.get("cause") or "-")]
+    if change.get("evidence"):
+        lines += ["", str(change["evidence"])]
 
-    if skipped:
-        lines += ["", "### Skipped changes (not auto-applied — needs a human)"]
-        lines += [
-            f"- `{s.change.file_path}` / {s.change.function_or_symbol}: {s.reason}" for s in skipped
-        ]
-
-    lines += ["", "### Verification"]
-    if not verification.ran:
-        lines.append(f"Not run: {verification.detail}")
-    elif verification.passed:
-        lines.append("Tests ran and passed.")
-    else:
-        lines.append(
-            f"Tests ran and FAILED — opening this PR for human review, not claiming it's fixed:\n\n```\n{verification.detail[-2000:]}\n```"
-        )
-
-    lines += [
-        "",
-        "🤖 Generated by coding_agent",
-    ]
-    return "\n".join(lines)
-
-
-def _flag(name: str) -> bool:
-    return os.environ.get(name, "").strip().lower() in {"1", "true", "yes"}
-
-
-def _open_pull_request_enabled() -> bool:
-    """PRs are OFF by default: the agent pushes a branch and stops, so the
-    team watches Jenkins on that branch and opens the PR themselves.
-    OPEN_PULL_REQUEST=true brings automatic PRs back."""
-    return _flag("OPEN_PULL_REQUEST")
-
-
-async def run_coding_agent(
-    tdd: TechnicalDesignDoc,
-    branch_name: str | None = None,
-    doc_text: str | None = None,
-    open_pull_request: bool | None = None,
-) -> dict:
-    """Runs the full pipeline for every service the TDD touches and PUSHES one
-    new branch per service (`branch_name`, the same name in every repo, else a
-    generated fix/... name) with one commit. No PR is opened unless
-    OPEN_PULL_REQUEST is enabled. Returns {"branches": [...], "skipped": [...],
-    "service_notes": [...], "warnings": [...]} — one branches entry per
-    service that got a pushed branch, every SkippedChange surfaced for a
-    human, and one service_notes entry {"service", "reason"} for every
-    resolved service that ended with nothing pushed, so a service never
-    disappears from the output without a reason."""
-    spec_by_service, skipped = resolve_services(tdd)
-    head = (branch_name or "").strip()
-    if open_pull_request is None:
-        open_pull_request = _open_pull_request_enabled()
-
-    changes_by_service: dict[str, list] = {}
-    for service_plan in tdd.services:
-        if service_plan.service in spec_by_service:
-            changes_by_service.setdefault(service_plan.service, []).extend(service_plan.changes)
-
-    branches = []
-    service_notes: list[dict] = []
-    warnings: list[dict] = []
-
-    def no_pr(service: str, reason: str) -> None:
-        service_notes.append({"service": service, "reason": reason})
-
-    for service, changes in changes_by_service.items():
-        spec = spec_by_service[service]
-        run_id = uuid.uuid4().hex[:8]
-
-        if not changes:
-            no_pr(service, "the TDD lists no file changes for this service")
-            continue
-        actionable, triage_skipped, references = triage_changes(service, changes)
-        skipped.extend(triage_skipped)
-        if not actionable:
-            parts = []
-            if references:
-                parts.append(f"{references} reference-only (read, not changed)")
-            if triage_skipped:
-                parts.append(f"{len(triage_skipped)} unverified by the planner")
-            no_pr(service, "no actionable changes: " + ", ".join(parts))
-            continue
-
-        try:
-            with cloned_repo(spec.repo, branch=spec.branch) as checkout:
-                repo_root = checkout.root
-                # The repo's REAL default branch (main, master, ...), never a
-                # hardcoded guess: the new branch starts here and a PR, when
-                # enabled, targets it.
-                base = spec.branch or checkout.default_branch
-
-                # The branch name the user chose (same in every repo) is used
-                # INSTEAD of a generated fix/... name. Checked before any LLM
-                # call: it must not be the base/default branch, and it must not
-                # exist yet — the agent only ever creates branches.
-                if head:
-                    if head in (base, checkout.default_branch):
-                        reason = f"branch name {head!r} is this repo's base/default branch"
-                    elif github_api.branch_exists(spec.repo, head):
-                        reason = (
-                            f"branch {head!r} already exists in {spec.repo} — delete it or "
-                            "choose a new name; the agent never writes to an existing branch"
-                        )
-                    else:
-                        reason = None
-                    if reason:
-                        skipped.extend(SkippedChange(service, c, reason) for c in actionable)
-                        no_pr(service, reason)
-                        continue
-
-                service_verified, service_skipped = verify_changes_for_service(
-                    service, spec, repo_root, actionable
-                )
-                skipped.extend(service_skipped)
-                if not service_verified:
-                    no_pr(service, "no change passed the checks against the repo — see skipped")
-                    continue
-
-                patches, patch_skipped = await _build_patches(
-                    repo_root, service, service_verified, doc_text
-                )
-                skipped.extend(patch_skipped)
-                if not patches:
-                    no_pr(service, "no code could be produced — see skipped")
-                    continue
-
-                to_commit = repo_ops.changed_patches(repo_root, patches)
-                patches, to_commit, pair_skipped, pair_warnings = enforce_test_pairs(
-                    service, changes, patches, to_commit
-                )
-                skipped.extend(pair_skipped)
-                warnings.extend({"service": service, "message": w} for w in pair_warnings)
-                repo_ops.apply_patches(repo_root, patches)
-                if not to_commit:
-                    no_pr(
-                        service, "the generated code was identical to the repo — nothing to commit"
-                    )
-                    continue
-
-                # Testing is left to CI: Jenkins builds and tests the pushed
-                # branch. A local run on a fresh download (no dependencies
-                # installed) cannot give a real result, so it is off unless
-                # RUN_LOCAL_TESTS is enabled.
-                if _flag("RUN_LOCAL_TESTS"):
-                    verification = test_runner.run_tests(repo_root)
-                else:
-                    verification = VerificationResult(
-                        ran=False,
-                        passed=False,
-                        detail="not run by the agent — Jenkins runs the tests on the pushed branch",
-                    )
-
-                new_branch = head or repo_ops.branch_name(tdd.issue_summary, run_id)
-                # With no PR, the commit message carries what the PR body used
-                # to: acceptance criteria, files, skipped changes, warnings and
-                # the test result — visible on GitHub next to the code.
-                summary = _pr_body(
-                    tdd,
-                    service_verified,
-                    to_commit,
-                    [s for s in skipped if s.service == service],
-                    verification,
-                    pair_warnings,
-                )
-                repo_ops.commit_patches(
-                    spec.repo,
-                    repo_root,
-                    checkout.head_sha,
-                    new_branch,
-                    f"fix: {tdd.title}\n\n{summary}",
-                    to_commit,
-                )
-                pr_url = None
-                if open_pull_request:
-                    pr_url = github_api.create_pull_request(
-                        spec.repo,
-                        head=new_branch,
-                        base=base,
-                        title=f"fix: {tdd.title}",
-                        body=summary,
-                    )
-                branches.append(
-                    {
-                        "service": service,
-                        "repo": spec.repo,
-                        "branch": new_branch,
-                        "branch_url": github_api.branch_web_url(spec.repo, new_branch),
-                        "pr_url": pr_url,
-                        "verification": verification,
-                        "changes_applied": len(to_commit),
-                        "changes_total": len(
-                            {c.file_path for c in changes if c.change_type != "reference"}
-                        ),
-                    }
-                )
-        except (RepoFetchError, repo_ops.RepoOpsError, github_api.GitHubApiError) as e:
-            # One service failing must not lose the branches already pushed
-            # for the others — report it as skipped, with the real reason.
-            skipped.extend(
-                SkippedChange(service, c, f"{type(e).__name__}: {e}") for c in actionable
+    lines += ["", "### Changes"]
+    status = {c.path: c.status for c in changes}
+    for item in change.get("plan") or []:
+        if isinstance(item, dict) and item.get("path") in status:
+            why = f" Why: {item['why']}" if item.get("why") else ""
+            lines.append(
+                f"- `{item['path']}` ({status[item['path']]}): {item.get('change') or ''}{why}"
             )
-            no_pr(service, f"{type(e).__name__} — see skipped")
+    planned = {i.get("path") for i in change.get("plan") or [] if isinstance(i, dict)}
+    lines += [f"- `{c.path}` ({c.status})" for c in changes if c.path not in planned]
 
-    return {
-        "branches": branches,
-        "skipped": skipped,
-        "service_notes": service_notes,
-        "warnings": warnings,
-    }
+    def bullets(title: str, values) -> None:
+        values = [str(v) for v in values or [] if v]
+        if values:
+            lines.extend(["", f"### {title}", *(f"- {v}" for v in values)])
+
+    reqs = [
+        f"{r.get('requirement')}: {r.get('met_by')}"
+        for r in change.get("requirements") or []
+        if isinstance(r, dict)
+    ]
+    bullets("Requirements and how they are met", reqs)
+    answers = [
+        f"{a.get('item')}: {a.get('answer')} ({a.get('evidence') or 'no evidence given'})"
+        for a in change.get("answers") or []
+        if isinstance(a, dict)
+    ]
+    bullets("Open questions and risks: what the code shows", answers)
+    bullets("Where this differs from the TDD", change.get("differs_from_tdd"))
+    bullets("Found by the agent's review (sent back for a fix)", outcome.review)
+    bullets("Shared code changed", change.get("shared_code"))
+    bullets("To check in review", change.get("doubts"))
+    bullets("Open questions from the TDD", task.open_questions)
+    if pack.missing:
+        bullets("TDD paths not found in the repository", pack.missing)
+
+    if task.tests:
+        lines += ["", "### Test plan (from the TDD)"]
+        lines += [f"{n}. {t}" for n, t in enumerate(task.tests, start=1)]
+
+    lines += ["", "### Checks by the agent"]
+    if outcome.problems:
+        lines += [f"- Not passed: {p}" for p in outcome.problems]
+    else:
+        lines.append("- Syntax, imports and scope of the changed files: passed.")
+    lines += [f"- {n}" for n in outcome.notes]
+    lines.append("- Not built or tested by the agent: Jenkins builds this branch.")
+    lines += ["", f"🤖 Generated by coding_agent from the TDD ({outcome.calls} model call(s))."]
+    return "\n".join(lines)

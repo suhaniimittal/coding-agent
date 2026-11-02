@@ -141,12 +141,13 @@ def create_pull_request(
     title: str,
     body: str,
     token: str | None = None,
+    draft: bool = False,
 ) -> str:
     """Opens a PR from `head` (the branch the coding agent just pushed) into
-    `base` (the service's default/manifest branch) — never a merge, always a
-    PR for human review. Returns the PR's html_url."""
+    `base` (the branch the TDD names) — never a merge, always a PR for human
+    review; `draft` opens it as a draft. Returns the PR's html_url."""
     url = _repo_api(repo, "/pulls")
-    payload = {"title": title, "body": body, "head": head, "base": base}
+    payload = {"title": title, "body": body, "head": head, "base": base, "draft": draft}
     try:
         resp = httpx.post(url, headers=_headers(token), json=payload, timeout=_TIMEOUT)
         resp.raise_for_status()
