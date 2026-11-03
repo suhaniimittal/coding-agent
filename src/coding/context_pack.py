@@ -261,6 +261,12 @@ def build(tools: RepoTools, index: Index, task: Task, service: str) -> Pack:
     return pack
 
 
+def file_block(tools: RepoTools, path: str, why: str) -> str | None:
+    """One file, numbered, whole up to WHERE_FILE_CHARS: for the files the
+    model kept after its look round (coder.py)."""
+    return _file_block(tools, path, why, [], WHERE_FILE_CHARS)
+
+
 def _file_block(
     tools: RepoTools, path: str, why: str, names: list[str], limit: int = FILE_CHARS
 ) -> str | None:

@@ -7,8 +7,8 @@ Per service in the TDD's "Services to change" table, one after another:
 1. download the repository at the TDD's commit into this run's folder
    (workspace.py; no git, no Neo4j);
 2. gather the code around the TDD's files (context_pack.py, no model call);
-3. the coding model's rounds (coder.py: look, change, fix if the checks
-   found problems);
+3. the coding model's five calls (coder.py: understand, write, verify,
+   fix what failed, verify again), with our code's checks between them;
 4. the changed files (by fingerprint) as ONE commit on a NEW branch, made
    through the GitHub API; an existing branch is never written to;
 5. a pull request into the TDD's branch, as a draft unless CODING_DRAFT_PR
@@ -151,10 +151,13 @@ def _open_pr(target: ServiceTarget, branch: str, title: str, body: str, draft: b
 
 
 def _draft_reasons(task: Task, outcome: coder.Outcome) -> list[str]:
+    """Why the pull request is a draft; none when every check passed, every
+    checklist item passed (or can only be judged by a person), and the final
+    code is the code the last check judged."""
     reasons = [f"check not passed: {p}" for p in outcome.problems]
     reasons += [f"over the size limit: {p}" for p in outcome.over_limits]
-    if str(outcome.change.get("confidence") or "").lower() != "high":
-        reasons.append(f"the model's confidence is {outcome.change.get('confidence') or 'unknown'}")
+    if not outcome.verified:
+        reasons.append("the final change was not checked against the checklist")
     if task.status == "draft":
         reasons.append("the TDD is a draft")
     if task.high_level:
@@ -229,12 +232,21 @@ def _pr_body(
         if values:
             lines.extend(["", f"### {title}", *(f"- {v}" for v in values)])
 
-    reqs = [
-        f"{r.get('requirement')}: {r.get('met_by')}"
-        for r in change.get("requirements") or []
-        if isinstance(r, dict)
+    marks = {"pass": "✅", "fail": "❌", "unsure": "❔"}
+    checklist = [
+        f"{marks.get(i.get('verdict'), '⏺')} {i['id']}"
+        + (f" ({', '.join(i['covers'])})" if i.get("covers") else "")
+        + f": {i['check']}"
+        + (f" — `{i['at']}`" if i.get("at") else "")
+        for i in outcome.checklist
     ]
-    bullets("Requirements and how they are met", reqs)
+    bullets("Checklist (✅ passed the agent's check, ❌ failed, ❔ for a person)", checklist)
+    by_hand = [
+        f"{i['id']}: {i.get('why') or i['check']}"
+        for i in outcome.checklist
+        if i.get("verdict") == "unsure"
+    ]
+    bullets("To check by hand", by_hand)
     answers = [
         f"{a.get('item')}: {a.get('answer')} ({a.get('evidence') or 'no evidence given'})"
         for a in change.get("answers") or []
@@ -242,10 +254,14 @@ def _pr_body(
     ]
     bullets("Open questions and risks: what the code shows", answers)
     bullets("Where this differs from the TDD", change.get("differs_from_tdd"))
-    bullets("Found by the agent's review (sent back for a fix)", outcome.review)
+    bullets("Found by the agent's first check (sent back for a fix)", outcome.review)
     bullets("Shared code changed", change.get("shared_code"))
     bullets("To check in review", change.get("doubts"))
-    bullets("Open questions from the TDD", task.open_questions)
+    if task.open_questions_detail:
+        decide = [q.question for q in task.card_questions()]
+        bullets("Open questions for a person to decide", decide)
+    else:
+        bullets("Open questions from the TDD", task.open_questions)
     if pack.missing:
         bullets("TDD paths not found in the repository", pack.missing)
 

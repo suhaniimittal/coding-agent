@@ -28,6 +28,9 @@ _MODEL_REJECTED = re.compile(
 )
 _OPENAI_MODEL = "gpt-5.4"
 _OPENAI_REASONING_EFFORT = "high"
+# Room for the model's thinking on top of the answer, per effort: a look or a
+# review needs far less than writing the change, and thinking is most of a call's time.
+_THINKING_TOKENS = {"low": 6000, "medium": 14000, "high": 24000}
 
 _working_model: str | None = None
 
@@ -58,13 +61,17 @@ def _models() -> list[str]:
     return list(dict.fromkeys(m for m in [*chosen, *_GATEWAY_MODELS] if m))
 
 
-async def complete(system_prompt: str, user_prompt: str, max_tokens: int = 16000) -> str:
+async def complete(
+    system_prompt: str, user_prompt: str, max_tokens: int = 16000, effort: str | None = None
+) -> str:
     """The model's answer as text. The prompts ask for one JSON object; on
-    OpenAI that is also enforced by the response format."""
+    OpenAI that is also enforced by the response format. `effort` ("low",
+    "medium", "high") sets how long OpenAI thinks; the gateway has no such
+    setting and ignores it."""
     try:
         if use_gateway():
             return await _via_gateway(system_prompt, user_prompt, max_tokens)
-        return await _via_openai(system_prompt, user_prompt, max_tokens)
+        return await _via_openai(system_prompt, user_prompt, max_tokens, effort)
     except LlmError:
         raise
     except Exception as e:  # noqa: BLE001 - any provider error is one clear failure
@@ -98,7 +105,10 @@ async def _via_gateway(system_prompt: str, user_prompt: str, max_tokens: int) ->
     raise LlmError("no model answered")  # unreachable: the last model raises
 
 
-async def _via_openai(system_prompt: str, user_prompt: str, max_tokens: int) -> str:
+async def _via_openai(
+    system_prompt: str, user_prompt: str, max_tokens: int, effort: str | None = None
+) -> str:
+    effort = effort if effort in _THINKING_TOKENS else _OPENAI_REASONING_EFFORT
     from openai import AsyncOpenAI
 
     client = AsyncOpenAI()  # reads OPENAI_API_KEY from the environment
@@ -109,9 +119,8 @@ async def _via_openai(system_prompt: str, user_prompt: str, max_tokens: int) -> 
             {"role": "user", "content": user_prompt},
         ],
         response_format={"type": "json_object"},
-        # Room for the thinking on top of the answer.
-        max_completion_tokens=max_tokens + 24000,
-        reasoning_effort=_OPENAI_REASONING_EFFORT,
+        max_completion_tokens=max_tokens + _THINKING_TOKENS[effort],
+        reasoning_effort=effort,
     )
     return resp.choices[0].message.content or ""
 

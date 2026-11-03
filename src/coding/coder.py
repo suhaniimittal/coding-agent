@@ -1,24 +1,29 @@
-"""The coding model's rounds for one service (2026-11-02): few calls, each
-with a lot of code, like the planner's old lookup loop.
+"""The coding model's five calls for one service (2026-11-03). Each call has
+one job; between them our code checks what it can without a model:
 
-    round 1 .. LOOK_ROUNDS+1   the task + the context pack (+ what it asked
-                               to see). It answers "need" (our code runs
-                               every request at once and adds the results),
-                               the change, or give_up. The last round must
-                               give the change or give up.
-    apply                      each edit names its lines by number, checked
-                               against its first and last line
-    checks                     code_checks.py: syntax, imports, scope, ...;
-                               and every TDD open question and risk answered
-    review (CODING_REVIEW)     a fresh call reads only the diff against the
-                               ticket: unasked behaviour changes, unmet
-                               requirements, unanswered questions
-    fix (FIX_ROUNDS)           the checks' problems and the review's findings
-                               together -> the model corrects them
+    1 understand   the task + the context pack -> the checklist (what must
+                   be true, each item covering requirements R1.. and test-
+                   plan items T1..), where the code decides it, the answers,
+                   what else it needs ("need": our code runs it, at most 15)
+      code         any R or T no item covers becomes an item of its own
+    2 write        the task, the checklist and the kept files -> the change,
+                   with "met_by": the edits behind each item
+      code         apply (a uniform indentation shift is removed); checks:
+                   syntax, imports, scope, ... (code_checks.py), every
+                   question answered, every item met by an edit that changed
+                   a file
+    3 verify       a fresh call: the checklist, the code before and after,
+                   who uses it; pass / fail / unsure per item, a pass quoting
+                   its line. A quote not in the file is a fail. Everything
+                   passed and nothing found: done, 3 calls.
+    4 fix          only what failed -> edits
+      code         apply and the same checks
+    5 verify       the whole checklist again, on the final code
 
-Typical: 3 calls (look, change, review). At most LOOK_ROUNDS + 1 + review +
-FIX_ROUNDS, plus one resend when an answer can't be used: 5 by default. Nothing here logs code: only
-counts, paths and the model's own short fields.
+At most MAX_CALLS calls, a resend of an unusable answer included: whatever
+is still open when they are spent goes to the pull request, which is then a
+draft. Nothing here logs code: only counts, paths and the model's own short
+fields.
 """
 
 from __future__ import annotations
@@ -27,42 +32,31 @@ import difflib
 import json
 import os
 import re
+import time
 from dataclasses import dataclass, field
 
-from . import code_checks, llm, prompts
+from . import code_checks, context_pack, llm, prompts
 from .context_pack import Index, Pack
 from .repo_tools import RepoTools, ToolError, is_test_path
 from .tdd_reader import Task
 
+MAX_CALLS = 5
 MAX_LOOKUPS = 15
 LOOKUP_CHARS = 30_000
 LOOKUPS_TOTAL = 75_000
 _READ_LINES = 1_500
-_REVIEW_CONTEXT = 25  # lines of code around each change the reviewer sees
+_VERIFY_CONTEXT = 25  # lines of code around each change the check sees
+_VERIFY_CHARS = 120_000  # the before/after listings, all files
+_USERS_PER_FILE = 20
+_KEEP_FILES = 15  # files the model may keep after its first call
+# How long the model thinks per call (OpenAI; the gateway ignores it): the
+# change, its fix and the check of it need the most.
+_EFFORT = {"understand": "medium", "change": "high", "verify": "high", "fix": "high"}
 _FIX_FILE_CHARS = 130_000  # a whole "Where" file (context_pack.WHERE_FILE_CHARS), numbered
 _NUMBERED = re.compile(r"^\s*\d+  ")
 # A blank line as shown is " 1207  "; copied, it often loses its two spaces.
 _NUMBER_ONLY = re.compile(r"^\s*\d+\s*$")
-
-
-def _setting(name: str, default: int) -> int:
-    try:
-        return max(0, int(os.environ.get(name) or default))
-    except ValueError:
-        return default
-
-
-def look_rounds() -> int:
-    return _setting("CODING_LOOK_ROUNDS", 1)
-
-
-def fix_rounds() -> int:
-    return _setting("CODING_FIX_ROUNDS", 1)
-
-
-def review_enabled() -> bool:
-    """CODING_REVIEW=false skips the review call (one model call less)."""
-    return os.environ.get("CODING_REVIEW", "").strip().lower() not in {"0", "false", "no"}
+_ITEM_ID = re.compile(r"^[RT]\d+$")
 
 
 def write_tests() -> bool:
@@ -76,12 +70,16 @@ class Outcome:
     status: str  # "changed" | "gave_up" | "no_change" | "failed"
     change: dict = field(default_factory=dict)
     reason: str = ""
-    problems: list[str] = field(default_factory=list)  # still open after the fix rounds
+    problems: list[str] = field(default_factory=list)  # still open after the fix
     over_limits: list[str] = field(default_factory=list)
     notes: list[str] = field(default_factory=list)
     calls: int = 0
     lookups: int = 0
-    review: list[str] = field(default_factory=list)  # found by the review, sent to the fix
+    review: list[str] = field(default_factory=list)  # found by the first check, sent to the fix
+    # Each item: "id", "check", "covers", "kind", "where", and once checked
+    # "verdict" ("pass" | "fail" | "unsure"), "why", "at" (path:line of a pass).
+    checklist: list[dict] = field(default_factory=list)
+    verified: bool = False  # the final code is the code the last check judged
 
 
 @dataclass
@@ -94,68 +92,110 @@ class _Session:
     lookup_chars: int = 0
     resent: bool = False
     planned: set[str] = field(default_factory=set)  # every path any plan named
-    review: list[str] = field(default_factory=list)  # what the review call found
+    review: list[str] = field(default_factory=list)  # what the first check found
+    kept: list[str] = field(default_factory=list)  # files the model kept after call 1
+    checklist: list[dict] = field(default_factory=list)
+    met_by: dict[str, tuple[dict, list]] = field(default_factory=dict)  # id -> (entry, its edits)
+    verified_diff: str | None = None  # the diff the last check judged
+    notes: list[str] = field(default_factory=list)
 
 
 async def run(task: Task, service: str, tools: RepoTools, index: Index, pack: Pack) -> Outcome:
     s = _Session(service, tools, index)
-    base = prompts.task_text(task, service) + "\n\n" + pack.text
-    looked: list[str] = []
-    rounds = look_rounds() + 1
-    change: dict | None = None
-    for r in range(1, rounds + 1):
-        last = r == rounds
-        instruction = (prompts.LAST if last else prompts.LOOK).format(round=r, rounds=rounds)
-        try:
-            reply = await _ask(s, _join(base, *looked, instruction), allow_need=not last)
-        except llm.LlmError as e:
-            return Outcome("failed", reason=str(e), calls=s.calls, lookups=s.lookups)
-        if "give_up" in reply:
-            return _gave_up(reply, s)
-        if "need" in reply:
-            results = _lookups(s, reply["need"])
-            print(f"  [CODER] {service} round {r}: ran {results[1]} request(s) it asked for")
-            looked.append(
-                f"## What you asked to see in round {r}\nWhy: {reply.get('why') or '-'}\n\n"
-                + results[0]
-            )
-            continue
-        change = reply
-        break
-    if change is None:  # unreachable: the last round only accepts a change or give_up
-        return Outcome("failed", reason="no change was given", calls=s.calls, lookups=s.lookups)
+    intro = prompts.task_text(task, service)
+    full = intro + "\n\n" + pack.text
 
-    problems, result = _apply_and_check(s, change)
-    problems += _unanswered(task, change)
-    # The review reads only the applied diff, so it runs when every edit applied;
-    # what it finds goes into the same single fix round as the checks' problems.
-    if review_enabled() and tools.changed() and not any(p.startswith("edit ") for p in problems):
-        s.review = await _review(s, task, change)
-        problems += [f"review: {f}" for f in s.review]
-    for n in range(1, fix_rounds() + 1):
-        if not problems:
-            break
-        print(f"  [CODER] {service}: {len(problems)} problem(s); fix round {n}")
-        for p in problems:
-            print(f"  [CODER] {service}:   {_brief(p)}")
-        user = _join(
-            base,
-            *looked,
-            "## Your change\n" + json.dumps(_without_edits(change), indent=1, ensure_ascii=False),
-            "## Applied so far, as a diff\n" + tools.diff(),
-            "## The files you changed, as they are now\n" + _current_files(tools),
-            prompts.FIX.format(problems="\n".join(f"- {p}" for p in problems)),
+    # 1. understand: the whole starter pack, once.
+    try:
+        found = await _ask(
+            s, prompts.UNDERSTAND, _join(full, prompts.UNDERSTAND_STEP), "understand", _understood
         )
-        try:
-            reply = await _ask(s, user, allow_need=False)
-        except llm.LlmError as e:
-            return _changed(change, problems, result, s, note=f"the fix round failed: {e}")
-        if "give_up" in reply:
-            return _gave_up(reply, s)
-        change = _merge(change, reply)
-        problems, result = _apply_and_check(s, reply)
-        problems += _unanswered(task, change)
+    except llm.LlmError as e:
+        return Outcome("failed", reason=str(e), calls=s.calls, lookups=s.lookups)
+    if "give_up" in found:
+        return _gave_up(found, s)
+    s.checklist = _checklist(task, found, s)
+    s.kept = _kept(s, found.get("keep"))
+    looked = ""
+    if found.get("need"):
+        results, ran = _lookups(s, found["need"])
+        looked = "## What you asked to see\n\n" + results
+        print(f"  [CODER] {service}: ran {ran} request(s) it asked for, kept {len(s.kept)} file(s)")
+    understood = _join(_checklist_text(s.checklist), _found_text(found))
+    # Later calls carry the files the model kept, not the whole pack.
+    base = _focused(s, intro) if s.kept else full
 
+    # 2. write.
+    try:
+        change = await _ask(
+            s,
+            prompts.system(write_tests()),
+            _join(base, looked, understood, prompts.WRITE_STEP),
+            "change",
+            _a_change,
+        )
+    except llm.LlmError as e:
+        return Outcome(
+            "failed", reason=str(e), calls=s.calls, lookups=s.lookups, checklist=s.checklist
+        )
+    if "give_up" in change:
+        return _gave_up(change, s)
+    change["answers"] = _union_answers(found.get("answers"), change.get("answers"))
+    problems, result = _apply_and_check(s, change)
+    problems += _unanswered(task, change) + _unmet(s, change)
+
+    # 3. verify: only a change whose every edit applied can be judged.
+    edits_failed = any(p.startswith("edit ") for p in problems)
+    if tools.changed() and not edits_failed:
+        failed = await _verify(s, intro, problems)
+        if failed is not None:
+            s.review = failed
+            problems += failed
+            if not problems:
+                return _changed(change, [], result, s)
+
+    if not tools.changed() and not edits_failed:
+        return Outcome(
+            "no_change",
+            change,
+            "the change left every file as it was",
+            calls=s.calls,
+            lookups=s.lookups,
+            checklist=s.checklist,
+        )
+    if not problems:  # the check could not run, and nothing else was found
+        return _changed(change, [], result, s)
+
+    # 4. fix: only what is open.
+    print(f"  [CODER] {service}: {len(problems)} problem(s); fix")
+    for p in problems:
+        print(f"  [CODER] {service}:   {_brief(p)}")
+    # Edited files are shown as they are now below, so not again as kept.
+    base = _focused(s, intro, skip=set(tools.edited())) if s.kept else full
+    user = _join(
+        base,
+        looked,
+        _checklist_text(s.checklist),
+        "## Your change\n" + json.dumps(_without_edits(change), indent=1, ensure_ascii=False),
+        "## Applied so far, as a diff\n" + tools.diff(),
+        "## The files you changed, as they are now\n" + _current_files(tools),
+        prompts.FIX.format(problems="\n".join(f"- {p}" for p in problems)),
+    )
+    try:
+        reply = await _ask(s, prompts.system(write_tests()), user, "fix", _a_fix)
+    except llm.LlmError as e:
+        return _changed(change, problems, result, s, note=f"the fix call failed: {e}")
+    if "give_up" in reply:
+        reason = str(reply.get("give_up") or "no reason given")
+        return _changed(change, problems, result, s, note=f"the fix was given up: {reason}")
+    change = _merge(change, reply)
+    problems, result = _apply_and_check(s, reply)
+    problems += _unanswered(task, change) + _unmet(s, reply)
+
+    # 5. verify again: the whole checklist, on the final code.
+    if tools.changed() and not any(p.startswith("edit ") for p in problems):
+        failed = await _verify(s, intro, problems)
+        problems += failed or []
     if not tools.changed():
         return Outcome(
             "no_change",
@@ -163,6 +203,7 @@ async def run(task: Task, service: str, tools: RepoTools, index: Index, pack: Pa
             "the change left every file as it was",
             calls=s.calls,
             lookups=s.lookups,
+            checklist=s.checklist,
         )
     return _changed(change, problems, result, s)
 
@@ -170,65 +211,112 @@ async def run(task: Task, service: str, tools: RepoTools, index: Index, pack: Pa
 def _changed(
     change: dict, problems: list[str], result: code_checks.Result, s: _Session, note: str = ""
 ) -> Outcome:
-    notes = result.notes + ([note] if note else [])
+    notes = result.notes + s.notes + ([note] if note else [])
+    verified = s.verified_diff is not None and s.verified_diff == s.tools.diff()
+    passed = sum(1 for i in s.checklist if i.get("verdict") == "pass")
     print(
         f"  [CODER] {s.service}: changed {len(s.tools.changed())} file(s), "
-        f"confidence {change.get('confidence') or '?'}, {len(problems)} open problem(s), "
-        f"{s.calls} model call(s)"
+        f"{passed}/{len(s.checklist)} item(s) passed, {len(problems)} open problem(s), "
+        f"{'verified' if verified else 'NOT verified'}, {s.calls} model call(s)"
     )
     return Outcome(
-        "changed", change, "", problems, result.over_limits, notes, s.calls, s.lookups, s.review
+        "changed",
+        change,
+        "",
+        problems,
+        result.over_limits,
+        notes,
+        s.calls,
+        s.lookups,
+        s.review,
+        s.checklist,
+        verified,
     )
 
 
 def _gave_up(reply: dict, s: _Session) -> Outcome:
     reason = str(reply.get("give_up") or "no reason given")
     print(f"  [CODER] {s.service}: gave up: {reason[:300]}")
-    return Outcome("gave_up", reply, reason, calls=s.calls, lookups=s.lookups)
+    return Outcome(
+        "gave_up", reply, reason, calls=s.calls, lookups=s.lookups, checklist=s.checklist
+    )
 
 
-async def _ask(s: _Session, user: str, allow_need: bool) -> dict:
-    """One model call, and one resend (once per service) when the answer is
-    not a usable shape."""
-    reply = await _call(s, user)
-    problem = _shape_problem(reply, allow_need)
-    if problem and not s.resent:
+async def _ask(s: _Session, system: str, user: str, step: str, shape) -> dict:
+    """One model call, and one resend (once per service, within the budget)
+    when `shape` finds the answer unusable."""
+    reply = await _call(s, system, user, step)
+    problem = shape(reply)
+    if problem and not s.resent and s.calls < MAX_CALLS:
         s.resent = True
         print(f"  [CODER] {s.service}: answer not usable ({problem}); asking once more")
-        allowed = "A, B or C" if allow_need else "B or C"
         reply = await _call(
             s,
+            system,
             f"{user}\n\n## Your previous answer could not be used\n{problem}\n"
-            f"Answer again with one JSON object of shape {allowed}.",
+            "Answer again with one JSON object of the shape asked for.",
+            step,
         )
-        problem = _shape_problem(reply, allow_need)
+        problem = shape(reply)
     if problem:
         raise llm.LlmError(f"the model's answer could not be used: {problem}")
     return reply
 
 
-async def _call(s: _Session, user: str) -> dict:
-    """The model's answer as an object. A failed call raises; an answer that
-    is not JSON comes back as {"_unusable": why}, for one resend."""
+async def _call(s: _Session, system: str, user: str, step: str) -> dict:
+    """The model's answer as an object. A failed call, or one past the
+    budget, raises; an answer that is not JSON comes back as
+    {"_unusable": why}, for one resend."""
+    if s.calls >= MAX_CALLS:
+        raise llm.LlmError(f"the {MAX_CALLS} model calls are spent")
     s.calls += 1
-    raw = await llm.complete(prompts.system(write_tests()), user)
+    started = time.monotonic()
+    raw = await llm.complete(system, user, effort=_EFFORT[step])
+    _timed(s, step, started, len(user))
     try:
         return llm.parse_json(raw)
     except llm.LlmError as e:
         return {"_unusable": str(e)}
 
 
-def _shape_problem(reply: dict, allow_need: bool) -> str:
+def _understood(reply: dict) -> str:
+    if "_unusable" in reply:
+        return reply["_unusable"]
+    if "give_up" in reply:
+        return ""
+    if not isinstance(reply.get("checklist"), list) or not reply["checklist"]:
+        return 'it has no "checklist" list'
+    return ""
+
+
+def _a_fix(reply: dict) -> str:
     if "_unusable" in reply:
         return reply["_unusable"]
     if "give_up" in reply:
         return ""
     if "need" in reply:
-        return "" if allow_need else "you can't ask to see more in this round"
+        return "you can't ask to see more now"
     if not isinstance(reply.get("edits"), list):
         return 'it has no "edits" list'
     if not isinstance(reply.get("plan"), list):
         return 'it has no "plan" list'
+    return ""
+
+
+def _a_change(reply: dict) -> str:
+    problem = _a_fix(reply)
+    if problem or "give_up" in reply:
+        return problem
+    if not isinstance(reply.get("met_by"), list):
+        return 'it has no "met_by" list'
+    return ""
+
+
+def _verdicts(reply: dict) -> str:
+    if "_unusable" in reply:
+        return reply["_unusable"]
+    if not isinstance(reply.get("items"), list):
+        return 'it has no "items" list'
     return ""
 
 
@@ -321,7 +409,7 @@ def _apply_and_check(s: _Session, change: dict) -> tuple[list[str], code_checks.
             )
             continue
         try:
-            s.tools.replace_lines(path, [(a, b, new) for _, a, b, new in group])
+            s.tools.replace_lines(path, _reindented(s, path, group))
         except ToolError as e:
             problems.append(f"edit {numbers} ({path}): {e}")
     s.planned |= {
@@ -330,6 +418,28 @@ def _apply_and_check(s: _Session, change: dict) -> tuple[list[str], code_checks.
     result = code_checks.run(s.tools, s.index.resolver, s.planned)
     result.notes += [f"test file not changed (tests are left to CI): {p}" for p in dropped]
     return problems + result.problems, result
+
+
+def _reindented(
+    s: _Session, path: str, group: list[tuple[int, int, int, str]]
+) -> list[tuple[int, int, str]]:
+    """A file's line edits as (start, end, new), each without a shift the
+    model added to all of it (_reindent). An edit next to another is left as
+    it is: together they may wrap code in a new block on purpose."""
+    lines = (s.tools.text(path) or "").split("\n")
+    spans = [(a, b) for _, a, b, _ in group]
+    out = []
+    for n, a, b, new in group:
+        alone = not any(b2 == a - 1 or a2 == b + 1 for a2, b2 in spans)
+        if alone:
+            new, shift = _reindent(new, lines[a - 1 : b])
+            if shift:
+                s.notes.append(
+                    f"edit {n} ({path}): every line sat {shift} space(s) deeper than the lines "
+                    "it replaced; the shift was removed"
+                )
+        out.append((a, b, new))
+    return out
 
 
 def _replace(tools: RepoTools, path: str, old: str, new: str) -> None:
@@ -381,45 +491,52 @@ def _current_files(tools: RepoTools) -> str:
     return "\n\n".join(parts)
 
 
-async def _review(s: _Session, task: Task, change: dict) -> list[str]:
-    """One fresh call that reads only the applied diff against the ticket and
-    returns its findings; a review that fails is noted, never fatal."""
-    user = _join(
-        prompts.task_text(task, s.service),
-        "## The author's account of the change\n"
-        + json.dumps(_without_edits(change), indent=1, ensure_ascii=False),
-        f"## The diff, with {_REVIEW_CONTEXT} lines around each change\n"
-        + s.tools.diff(context=_REVIEW_CONTEXT),
+def _timed(s: _Session, step: str, started: float, prompt_chars: int) -> None:
+    secs = time.monotonic() - started
+    print(
+        f"  [CODER] {s.service}: call {s.calls} ({step}): {secs:.0f} s, "
+        f"prompt {prompt_chars // 1000}k chars"
     )
-    s.calls += 1
-    try:
-        reply = llm.parse_json(await llm.complete(prompts.REVIEW, user))
-    except llm.LlmError as e:
-        print(f"  [CODER] {s.service}: review not run ({e})")
-        return []
-    findings = []
-    for f in reply.get("findings") or []:
-        if not isinstance(f, dict) or not f.get("problem"):
+
+
+def _kept(s: _Session, keep) -> list[str]:
+    """The files the model kept in call 1: real files only, at most _KEEP_FILES."""
+    out = []
+    for p in keep if isinstance(keep, list) else []:
+        path = _path(s, str(p or ""))
+        if path not in out and s.tools.text(path) is not None:
+            out.append(path)
+    return out[:_KEEP_FILES]
+
+
+def _focused(s: _Session, intro: str, skip: set[str] | None = None) -> str:
+    """The task and the kept files, whole: the prompt after call 1, in place
+    of the whole starter pack."""
+    blocks, size = [], 0
+    for path in s.kept:
+        if path in (skip or set()):
             continue
-        where = f"{f.get('path') or '?'}:{f.get('line') or '?'}"
-        fix = f" Fix: {f['fix']}" if f.get("fix") else ""
-        findings.append(f"{where}: {f['problem']}{fix}")
-    print(f"  [CODER] {s.service}: review: {len(findings)} finding(s)")
-    for f in findings:
-        print(f"  [CODER] {s.service}:   {f.split(chr(10), 1)[0][:200]}")
-    return findings
+        block = context_pack.file_block(s.tools, path, "you kept it")
+        if block is None or size + len(block) > context_pack.PACK_CHARS:
+            continue
+        blocks.append(block)
+        size += len(block)
+    head = "## The files you kept (line numbers are not part of the files)\n\n"
+    return _join(intro, head + "\n\n".join(blocks) if blocks else "")
 
 
 def _unanswered(task: Task, change: dict) -> list[str]:
-    """The TDD's open questions and risks the change gave no answer with
-    evidence for: sent to the fix round, as answering them can change the code."""
+    """The TDD's risks and the open questions the code can answer ("planner")
+    the change gave no answer with evidence for: sent to the fix, as
+    answering them can change the code. Questions a person decides ("card")
+    are not the change's to answer."""
     answers = [
         a
         for a in change.get("answers") or []
         if isinstance(a, dict) and str(a.get("answer") or "").strip() and a.get("evidence")
     ]
     missing = []
-    for item in [*task.open_questions, *task.risks]:
+    for item in [*(q.question for q in task.code_questions()), *task.risks]:
         if not any(_same_item(item, str(a.get("item") or "")) for a in answers):
             missing.append(f"open question or risk not answered with evidence: {item[:200]}")
     return missing
@@ -446,6 +563,7 @@ def _merge(old: dict, new: dict) -> dict:
     """The fix's answer, keeping fields of the first change it left out."""
     merged = {**old, **{k: v for k, v in new.items() if v not in (None, "", [])}}
     merged["plan"] = _union(old.get("plan"), new.get("plan"))
+    merged["answers"] = _union_answers(old.get("answers"), new.get("answers"))
     return merged
 
 
@@ -461,3 +579,275 @@ def _union(a, b) -> list:
 
 def _join(*parts: str) -> str:
     return "\n\n".join(p for p in parts if p)
+
+
+# --- the checklist and its check ------------------------------------------------------------
+
+
+def _checklist(task: Task, found: dict, s: _Session) -> list[dict]:
+    """Call 1's checklist, numbered C1, C2, ... by our code. A requirement or
+    test-plan item no item covers becomes an item of its own, in its own
+    words, so nothing the TDD asks for goes unchecked."""
+    items: list[dict] = []
+    for raw in found.get("checklist") or []:
+        if not isinstance(raw, dict) or not str(raw.get("check") or "").strip():
+            continue
+        covers = [str(c).strip().upper() for c in raw.get("covers") or []]
+        items.append(
+            {
+                "id": f"C{len(items) + 1}",
+                "check": str(raw["check"]).strip(),
+                "covers": [c for c in covers if _ITEM_ID.match(c)],
+                "kind": "unchanged" if raw.get("kind") == "unchanged" else "change",
+                "where": str(raw.get("where") or "").strip(),
+            }
+        )
+    covered = {c for item in items for c in item["covers"]}
+    missing = [(key, text) for key, text in prompts.item_ids(task).items() if key not in covered]
+    for key, text in missing:
+        item_id = f"C{len(items) + 1}"
+        items.append({"id": item_id, "check": text, "covers": [key], "kind": "change", "where": ""})
+    if missing:
+        note = "checklist: added what no item covered: " + ", ".join(k for k, _ in missing)
+        print(f"  [CODER] {s.service}: {note}")
+        s.notes.append(note)
+    return items
+
+
+def _checklist_text(checklist: list[dict]) -> str:
+    if not checklist:
+        return ""
+    lines = ["## The checklist (what must be true when the change is done)"]
+    for item in checklist:
+        covers = f" covers {', '.join(item['covers'])}" if item["covers"] else ""
+        where = f" Where: {item['where']}" if item["where"] else ""
+        lines.append(f"- {item['id']} [{item['kind']}{covers}]: {item['check']}{where}")
+    return "\n".join(lines)
+
+
+def _found_text(found: dict) -> str:
+    """What call 1 found besides the checklist, for the change."""
+    lines = ["## What call 1 found", f"Cause: {found.get('cause') or '-'}"]
+    places = [
+        f"- {p['path']}: {p.get('what') or ''}" + (f" Why: {p['why']}" if p.get("why") else "")
+        for p in found.get("locations") or []
+        if isinstance(p, dict) and p.get("path")
+    ]
+    answers = [
+        f"- {a['item']}: {a.get('answer') or '-'} ({a.get('evidence') or 'no evidence given'})"
+        for a in found.get("answers") or []
+        if isinstance(a, dict) and a.get("item")
+    ]
+    doubts = [f"- {d}" for d in found.get("doubts") or [] if d]
+    for title, rows in (("Where to change:", places), ("Answers so far:", answers)):
+        if rows:
+            lines += [title, *rows]
+    if doubts:
+        lines += ["Doubts:", *doubts]
+    return "\n".join(lines)
+
+
+def _unmet(s: _Session, change: dict) -> list[str]:
+    """The "change" items that no edit which changed a file, and no quoted
+    line that is in the code, makes true. The answer's "met_by" entries
+    replace earlier ones for the same item (the fix's count its own edits)."""
+    edits = change.get("edits") if isinstance(change.get("edits"), list) else []
+    for entry in change.get("met_by") or []:
+        if isinstance(entry, dict) and entry.get("item"):
+            s.met_by[str(entry["item"]).strip().upper()] = (entry, edits)
+    changed = set(s.tools.changed())
+    missing = []
+    for item in s.checklist:
+        if item["kind"] != "change":
+            continue
+        entry, its_edits = s.met_by.get(item["id"], (None, []))
+        if entry is None:
+            missing.append(
+                f"{item['id']} has no edit in met_by that makes it true: {item['check']}"
+            )
+            continue
+        numbers = [int(n) for n in entry.get("edits") or [] if str(n).isdigit()]
+        paths = {
+            _path(s, str(its_edits[n - 1].get("path") or ""))
+            for n in numbers
+            if 1 <= n <= len(its_edits) and isinstance(its_edits[n - 1], dict)
+        }
+        if paths & changed:
+            continue
+        already = str(entry.get("already") or "").split(":", 1)[0]
+        if entry.get("quote") and _quoted(s, already, str(entry["quote"])):
+            continue
+        missing.append(
+            f"{item['id']} is not met: met_by names no edit that changed a file and no line in "
+            f"the code that already makes it true: {item['check']}"
+        )
+    return missing
+
+
+async def _verify(s: _Session, intro: str, problems: list[str]) -> list[str] | None:
+    """A check call (3 or 5) on the code as it is now: sets each item's
+    verdict, and returns what failed and the findings, as problems for the
+    fix. None when no check could run (the budget is spent, or no usable
+    answer came back)."""
+    found = "\n".join(f"- {p}" for p in problems) or "- nothing"
+    user = _join(
+        intro,
+        _checklist_text(s.checklist),
+        "## What the automatic checks found\n" + found,
+        "## The change, file by file\n" + _before_after(s.tools),
+        _users(s),
+        prompts.VERIFY_STEP,
+    )
+    diff = s.tools.diff()
+    try:
+        reply = await _ask(s, prompts.VERIFY, user, "verify", _verdicts)
+    except llm.LlmError as e:
+        print(f"  [CODER] {s.service}: check not run ({e})")
+        return None
+    s.verified_diff = diff
+    by_id = {
+        str(v.get("id") or "").strip().upper(): v for v in reply["items"] if isinstance(v, dict)
+    }
+    failed = []
+    for item in s.checklist:
+        v = by_id.get(item["id"]) or {}
+        verdict, why = v.get("verdict"), str(v.get("why") or "").strip()
+        item.pop("at", None)
+        if verdict == "pass":
+            path = str(v.get("path") or "")
+            if _quoted(s, path, str(v.get("quote") or "")):
+                item["at"] = f"{_path(s, path)}:{v.get('line') or '?'}" if path else ""
+            else:
+                verdict = "fail"
+                why = f"its pass quotes no line that is in the code ({why or 'no trace given'})"
+        elif verdict not in ("fail", "unsure"):
+            verdict, why = "fail", "the check gave it no verdict"
+        item["verdict"], item["why"] = verdict, why
+        if verdict == "fail":
+            failed.append(f"{item['id']} not met: {item['check']} ({why or 'no reason given'})")
+    dropped = 0
+    for f in reply.get("findings") or []:
+        if isinstance(f, dict) and f.get("problem") and f.get("fix") and f.get("path"):
+            failed.append(f"{f['path']}:{f.get('line') or '?'}: {f['problem']} Fix: {f['fix']}")
+        else:
+            dropped += 1
+    counts = {k: 0 for k in ("pass", "fail", "unsure")}
+    for item in s.checklist:
+        counts[item["verdict"]] += 1
+    print(
+        f"  [CODER] {s.service}: check: {counts['pass']} pass, {counts['fail']} fail, "
+        f"{counts['unsure']} unsure; {len(failed) - counts['fail']} finding(s)"
+        + (f", {dropped} without a place or a fix dropped" if dropped else "")
+    )
+    return failed
+
+
+def _quoted(s: _Session, path: str, quote: str) -> bool:
+    """Whether `quote` is in the code (spaces aside): in the file at `path`,
+    else in any file the change edited. Too short a quote (a lone "}") never
+    counts."""
+    lines = [_squash(line) for line in _unnumber(quote).split("\n") if line.strip()]
+    if sum(len(line) for line in lines) < 10:
+        return False
+    candidates = [_path(s, path)] if path.strip() else []
+    candidates += [p for p in s.tools.edited() if p not in candidates]
+    for candidate in candidates:
+        text = s.tools.text(candidate) if (s.tools.root / candidate).is_file() else None
+        if text is None:
+            continue
+        squashed = "\n".join(_squash(line) for line in text.split("\n"))
+        if all(line in squashed for line in lines):
+            return True
+    return False
+
+
+def _squash(line: str) -> str:
+    return re.sub(r"\s+", "", line)
+
+
+def _before_after(tools: RepoTools) -> str:
+    """Every changed file's code before and after, numbered, around each
+    change: what the check judges, with the line numbers it quotes."""
+    parts, size = [], 0
+    for path in tools.changed():
+        before, after = tools.before(path), tools.text(path)
+        if after is None:
+            block = f"### {path}: deleted"
+        elif before is None:
+            new = after.split("\n")
+            block = f"### {path}: a new file\nAFTER:\n" + _numbered(new, [(0, len(new))])
+        else:
+            old, new = "\n".join(before.splitlines()).split("\n"), after.split("\n")
+            ops = difflib.SequenceMatcher(None, old, new, autojunk=False).get_opcodes()
+            ops = [op for op in ops if op[0] != "equal"]
+            block = (
+                f"### {path}\nBEFORE:\n{_numbered(old, [(i1, i2) for _, i1, i2, _, _ in ops])}"
+                f"\n\nAFTER:\n{_numbered(new, [(j1, j2) for _, _, _, j1, j2 in ops])}"
+            )
+        if size + len(block) > _VERIFY_CHARS:
+            block = f"### {path}: too long to show here"
+        parts.append(block)
+        size += len(block)
+    return "\n\n".join(parts) or "(no file changed)"
+
+
+def _numbered(lines: list[str], spans: list[tuple[int, int]]) -> str:
+    """`lines` numbered from 1, only _VERIFY_CONTEXT lines either side of
+    each span (0-based, end excluded); "..." where lines are left out."""
+    windows: list[tuple[int, int]] = []
+    for a, b in spans:
+        lo, hi = max(0, a - _VERIFY_CONTEXT), min(len(lines), max(b, a + 1) + _VERIFY_CONTEXT)
+        if windows and lo <= windows[-1][1]:
+            windows[-1] = (windows[-1][0], max(windows[-1][1], hi))
+        else:
+            windows.append((lo, hi))
+    out, last = [], 0
+    for lo, hi in windows:
+        if lo > last:
+            out.append("  ...")
+        out += [f"{n + 1:>5}  {lines[n]}" for n in range(lo, hi)]
+        last = hi
+    if last < len(lines):
+        out.append("  ...")
+    return "\n".join(out)
+
+
+def _users(s: _Session) -> str:
+    rows = []
+    for path in s.tools.changed():
+        users = s.index.importers(path)
+        if users:
+            rows.append(f"{path} is imported by {len(users)} file(s):")
+            rows += [f"  {f}:{n}: {line}" for f, n, line in users[:_USERS_PER_FILE]]
+    return "## Who uses them\n" + "\n".join(rows) if rows else ""
+
+
+def _reindent(new: str, old: list[str]) -> tuple[str, int]:
+    """`new` without a shift the model added to all of it: it takes the two
+    spaces after a shown line number for indentation (KS-17531: every block
+    it replaced moved two spaces right). When every line of `new` sits deeper
+    than the least indented line it replaces, the difference is removed.
+    (the text, the spaces removed)."""
+
+    def depth(line: str) -> int:
+        return len(line) - len(line.lstrip(" \t"))
+
+    lines = new.split("\n")
+    was = [depth(line) for line in old if line.strip()]
+    now = [depth(line) for line in lines if line.strip()]
+    if not was or not now or min(now) <= min(was):
+        return new, 0
+    shift = min(now) - min(was)
+    return "\n".join(line[shift:] if line.strip() else line for line in lines), shift
+
+
+def _union_answers(first, later) -> list:
+    """Both answers lists, the later answer kept for the same item."""
+    out, seen = [], set()
+    for a in [*(later or []), *(first or [])]:
+        if isinstance(a, dict):
+            key = str(a.get("item") or "").strip().lower()
+            if key and key not in seen:
+                seen.add(key)
+                out.append(a)
+    return out
